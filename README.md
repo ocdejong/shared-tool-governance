@@ -11,3 +11,7 @@ The agent selects a tool and supplies a reason. The package checks the owners' r
 3. Browser governance for site-bound sign-in and approved actions during a session.
 
 The repository is at the planning stage.
+
+## License
+
+[Apache License 2.0](LICENSE).
