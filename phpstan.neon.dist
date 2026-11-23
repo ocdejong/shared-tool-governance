@@ -1,0 +1,10 @@
+includes:
+    - vendor/pestphp/pest-plugin-phpstan/extension.neon
+
+parameters:
+    level: 8
+    phpVersion: 80300
+    paths:
+        - src
+        - database/migrations
+        - tests
