@@ -18,6 +18,11 @@ final class PruneActivity
     {
         $now = now();
         $cutoff = $now->copy()->subDays(Configuration::duration('retention_days'));
+        // The timestamp format used for invocation rows starts at year 1.
+        if ($cutoff->year < 1) {
+            return 0;
+        }
+
         $candidates = GovernanceInvocation::query();
         $candidates->where('created_at', '<=', $candidates->getModel()->fromDateTime($cutoff));
         $candidates->getQuery()->whereNotNull('frozen_inputs')->useWritePdo();

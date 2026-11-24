@@ -36,7 +36,7 @@ php artisan config:cache
 
 - `grant_lifetime_minutes` defaults to 5.
 - `approval_lifetime_minutes` defaults to 15.
-- `retention_days` defaults to 30 and controls how long private inputs are retained after a call reaches a terminal state.
+- `retention_days` defaults to 30 and controls how long private inputs are retained after a call reaches a terminal state. If the cutoff falls before year 1, pruning succeeds with zero invocations.
 
 Use whole numbers from 1 to 2,147,483,647 for these values. Published config can read them through Laravel's `env()` helper. Invalid values raise a configuration error when used. Changing the lifetimes only affects newly issued grants and approval requests. Register tool callbacks in PHP through the host's service provider so Laravel can cache the config.
 

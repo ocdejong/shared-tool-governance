@@ -131,6 +131,18 @@ it('applies configured lifetimes at issuance and retention when pruning', functi
     expect(Artisan::call('shared-tool-governance:prune'))->toBe(0, Artisan::output())
         ->and($denied->refresh()->getRawOriginal('frozen_inputs'))->not->toBeNull();
     $this->travelTo($now->copy()->addDays(2));
+    config(['shared-tool-governance.retention_days' => '2147483647']);
+    DB::enableQueryLog();
+    try {
+        expect(Artisan::call('shared-tool-governance:prune'))->toBe(0, Artisan::output())
+            ->and(DB::getQueryLog())->toBeEmpty();
+    } finally {
+        DB::disableQueryLog();
+        DB::flushQueryLog();
+    }
+    expect($denied->refresh()->getRawOriginal('frozen_inputs'))->not->toBeNull();
+
+    config(['shared-tool-governance.retention_days' => $retentionDays]);
     expect(Artisan::call('shared-tool-governance:prune'))->toBe(0, Artisan::output())
         ->and($denied->refresh()->getRawOriginal('frozen_inputs'))->toBeNull();
 })->with([
