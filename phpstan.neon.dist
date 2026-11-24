@@ -4,6 +4,8 @@ includes:
 parameters:
     level: 8
     phpVersion: 80300
+    scanFiles:
+        - examples/two-owner/TwoOwnerServiceProvider.php
     paths:
         - src
         - database/migrations

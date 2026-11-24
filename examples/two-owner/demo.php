@@ -8,6 +8,7 @@ use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Storage;
 use Ocdejong\SharedToolGovernance\Activity\Activity;
 use Ocdejong\SharedToolGovernance\Approvals\ApprovalDecision;
 use Ocdejong\SharedToolGovernance\Approvals\Approvals;
@@ -17,6 +18,7 @@ use Ocdejong\SharedToolGovernance\Data\VerifiedReply;
 use Ocdejong\SharedToolGovernance\Discovery\DiscoveryMode;
 use Ocdejong\SharedToolGovernance\Discovery\ToolDiscovery;
 use Ocdejong\SharedToolGovernance\Governance;
+use Ocdejong\SharedToolGovernance\Jobs\DeliverCompletion;
 use Ocdejong\SharedToolGovernance\LocalInbox\LocalInbox;
 use Ocdejong\SharedToolGovernance\Tools\ToolRegistry;
 
@@ -46,6 +48,26 @@ function runDemo(string $phase): void
     $jobs = DB::table('jobs')->where('queue', 'default');
     $callId = TwoOwnerServiceProvider::CALL_ID;
     check(Http::preventingStrayRequests(), 'Stray HTTP must be blocked in the demo.');
+
+    if ($phase === 'revoke') {
+        check($cache->get('demo.executions') === 1
+            && $approvals->receipt($callId) === ['status' => 'granted', 'outcome' => 'success'],
+            'Expected a committed success before revoking access.');
+        $payload = json_decode((string) $jobs->sole()->payload, true, flags: JSON_THROW_ON_ERROR);
+        check($payload['displayName'] === DeliverCompletion::class, 'Expected a waiting completion job.');
+        $cache->put('demo.audience', ['Pauline']);
+
+        return;
+    }
+
+    if ($phase === 'verify-revoked') {
+        check($jobs->count() === 0 && DB::table('failed_jobs')->count() === 0, 'Expected the completion worker to finish.');
+        check($cache->get('demo.executions') === 1 && Storage::disk('local')->allFiles('completion-inbox') === [],
+            'An audience change must leave no inbox entry and must not repeat execution.');
+        echo 'Revoked audience received no inbox result. The executor ran once.'.PHP_EOL;
+
+        return;
+    }
 
     if ($phase === 'verify') {
         check($cache->get('demo.executions') === 1, 'Expected one executor call after the restart.');
@@ -90,7 +112,7 @@ function runDemo(string $phase): void
         return;
     }
 
-    check($phase === 'prepare', 'Expected prepare or verify.');
+    check($phase === 'prepare', 'Unknown demo phase.');
     $host->seedOwnerRules();
     $context = $host->current();
     $scope = $context->scope;

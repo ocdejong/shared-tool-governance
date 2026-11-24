@@ -88,7 +88,7 @@ final class TwoOwnerServiceProvider extends ServiceProvider implements Completio
 
     public function current(): InvocationContext
     {
-        return new InvocationContext(self::scope(), $this->viewer, 'demo-runtime', self::MEMBERS);
+        return new InvocationContext(self::scope(), $this->viewer, 'demo-runtime', $this->audience());
     }
 
     public function viewAs(string $person): void
@@ -103,12 +103,19 @@ final class TwoOwnerServiceProvider extends ServiceProvider implements Completio
     public function forInvocation(Scope $scope, string $invocationId): ?InvocationContext
     {
         $request = Cache::store('database')->get('demo.request-context');
+        $audience = $this->audience();
         if (! is_array($request) || $request['id'] !== $invocationId
-            || ! $this->isMember($scope, $request['requester']) || $request['audience'] !== self::MEMBERS) {
+            || ! $this->isMember($scope, $request['requester']) || $request['audience'] !== $audience) {
             return null;
         }
 
-        return new InvocationContext($scope, $request['requester'], $request['runtime'], self::MEMBERS);
+        return new InvocationContext($scope, $request['requester'], $request['runtime'], $audience);
+    }
+
+    /** @return list<string> */
+    private function audience(): array
+    {
+        return Cache::store('database')->get('demo.audience', self::MEMBERS);
     }
 
     private static function scope(): Scope
