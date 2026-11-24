@@ -37,17 +37,6 @@
             ]
         }
     },
-    "archive": {
-        "exclude": [
-            "/.github",
-            "/AGENTS.md",
-            "/bin",
-            "/phpstan.neon.dist",
-            "/phpunit.xml.dist",
-            "/pint.json",
-            "/tests"
-        ]
-    },
     "scripts": {
         "test": [
             "@php vendor/bin/pest",

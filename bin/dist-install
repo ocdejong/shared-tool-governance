@@ -1,21 +1,42 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if (( $# != 1 )); then
-    echo 'Usage: bin/dist-install <rev>' >&2
+usage() {
+    echo 'Usage: bin/dist-install <rev> | --github <rev> | --packagist <version> <rev>' >&2
     exit 2
-fi
+}
+
+case "${1:-}" in
+    --github)
+        (( $# == 2 )) || usage
+        mode=github
+        shift
+        ;;
+    --packagist)
+        (( $# == 3 )) && [[ -n $2 ]] || usage
+        mode=packagist
+        release_version=$2
+        shift 2
+        ;;
+    --*|'')
+        usage
+        ;;
+    *)
+        (( $# == 1 )) || usage
+        mode=local
+        ;;
+esac
 
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 revision=$(git -C "$repo" rev-parse --verify --end-of-options "${1}^{commit}")
 package=ocdejong/shared-tool-governance
-version="0.0.0-alpha+$revision"
+version="${release_version:-0.0.0-alpha+$revision}"
 scratch=$(mktemp -d)
 trap 'rm -rf -- "$scratch"' EXIT
 
-mkdir "$scratch/export" "$scratch/artifacts"
 archive_name="shared-tool-governance-$revision"
 archive="$scratch/artifacts/$archive_name.zip"
+github_zip="https://api.github.com/repos/$package/zipball/$revision"
 database="$scratch/consumer/database/database.sqlite"
 app_key=$(php -r 'echo "base64:".base64_encode(random_bytes(32));')
 
@@ -35,26 +56,48 @@ artisan() {
 }
 
 git -C "$repo" ls-tree -r --name-only "$revision" -- database/migrations > "$scratch/migrations"
-git -C "$repo" archive "$revision" | tar -x -C "$scratch/export"
-(
-    cd "$scratch/export"
-    in_consumer php -r '
-        $manifest = json_decode(file_get_contents("composer.json"), true, flags: JSON_THROW_ON_ERROR);
-        $manifest["version"] = $argv[1];
-        if (file_put_contents("composer.json", json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)."\n") === false) {
-            exit(1);
-        }
-    ' "$version"
-    compose archive --format=zip --dir="$scratch/artifacts" --file="$archive_name"
-)
-rm -rf -- "$scratch/export"
+if [[ $mode == local ]]; then
+    mkdir "$scratch/export" "$scratch/artifacts"
+    git -C "$repo" archive "$revision" | tar -x -C "$scratch/export"
+    (
+        cd "$scratch/export"
+        in_consumer php -r '
+            $manifest = json_decode(file_get_contents("composer.json"), true, flags: JSON_THROW_ON_ERROR);
+            $manifest["version"] = $argv[1];
+            if (file_put_contents("composer.json", json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)."\n") === false) {
+                exit(1);
+            }
+        ' "$version"
+        compose archive --format=zip --dir="$scratch/artifacts" --file="$archive_name"
+    )
+    rm -rf -- "$scratch/export"
+fi
 
 cd "$scratch"
 compose create-project --no-dev --no-scripts --prefer-dist --no-progress \
     laravel/laravel consumer '^13.0'
 cd "$scratch/consumer"
 touch "$database"
-compose config repositories.governance artifact ../artifacts
+case "$mode" in
+    local)
+        compose config repositories.governance artifact ../artifacts
+        expected_dist=$archive
+        ;;
+    github)
+        # Before publication, supply the metadata Packagist derives from the tagged commit.
+        metadata=$(git -C "$repo" show "$revision:composer.json" | in_consumer php -r '
+            $manifest = json_decode(stream_get_contents(STDIN), true, flags: JSON_THROW_ON_ERROR);
+            $manifest["version"] = $argv[1];
+            $manifest["dist"] = ["type" => "zip", "url" => $argv[2], "reference" => $argv[3]];
+            echo json_encode(["type" => "package", "package" => $manifest], JSON_THROW_ON_ERROR);
+        ' "$version" "$github_zip" "$revision")
+        compose config repositories.governance "$metadata"
+        expected_dist=$github_zip
+        ;;
+    packagist)
+        expected_dist=$github_zip
+        ;;
+esac
 compose require --update-no-dev --prefer-dist --no-progress "$package:$version"
 
 cat > app/Providers/AppointmentServiceProvider.php <<'PHP'
@@ -268,21 +311,31 @@ function runSmoke(array $argv): void
         return;
     }
 
-    [, , $package, $version, $archive, $manifest] = $argv;
+    [, , $package, $version, $mode, $expectedDist, $revision, $manifest] = $argv;
     $installed = InstalledVersions::getInstallPath($package);
     check($installed !== null && realpath($installed) === __DIR__.'/vendor/'.$package && ! is_link($installed),
         'Expected an extracted vendor package.');
-    check(InstalledVersions::getPrettyVersion($package) === $version, 'Composer selected a different version.');
-    $lock = json_decode(file_get_contents(__DIR__.'/composer.lock'), true, flags: JSON_THROW_ON_ERROR);
-    $entries = array_column($lock['packages'], null, 'name');
-    $dist = $entries[$package]['dist'] ?? [];
-    check(($dist['type'] ?? null) === 'zip' && realpath($dist['url'] ?? '') === realpath($archive)
-        && ! isset($entries[$package]['source']), 'Composer did not resolve the local archive.');
+    check(ltrim(InstalledVersions::getPrettyVersion($package) ?? '', 'vV') === ltrim($version, 'vV'),
+        'Composer selected a different version.');
+    $installedMetadata = json_decode(file_get_contents(__DIR__.'/vendor/composer/installed.json'), true, flags: JSON_THROW_ON_ERROR);
+    $entries = array_column($installedMetadata['packages'], null, 'name');
+    $entry = $entries[$package] ?? [];
+    $dist = $entry['dist'] ?? [];
+    $url = $dist['url'] ?? '';
+    check(($entry['installation-source'] ?? null) === 'dist' && ($dist['type'] ?? null) === 'zip',
+        'Composer did not install a ZIP distribution.');
+    if ($mode === 'local') {
+        check(realpath($url) === realpath($expectedDist) && ! isset($entry['source']),
+            'Composer did not resolve the local archive.');
+    } else {
+        check($url === $expectedDist && ($dist['reference'] ?? null) === $revision,
+            'Composer did not resolve the expected GitHub ZIP and commit.');
+    }
 
     foreach (['src', 'config', 'database'] as $directory) {
         check(is_dir($installed.'/'.$directory), "Missing package directory $directory.");
     }
-    foreach (['tests', '.git'] as $excluded) {
+    foreach (['.git', '.gitattributes', '.github', '.gitignore', 'AGENTS.md', 'bin', 'phpstan.neon.dist', 'phpunit.xml.dist', 'pint.json', 'tests'] as $excluded) {
         check(! file_exists($installed.'/'.$excluded), "Unexpected package entry $excluded.");
     }
 
@@ -344,12 +397,15 @@ try {
 }
 PHP
 
-in_consumer php dist-smoke.php prepare "$package" "$version" "$archive" "$scratch/migrations"
+in_consumer php dist-smoke.php prepare "$package" "$version" "$mode" "$expected_dist" "$revision" "$scratch/migrations"
 artisan queue:work --once --queue=default --tries=1
 artisan queue:work --once --queue=default --tries=1
 in_consumer php dist-smoke.php verify
 
-output=$(mktemp -d)
-cp "$archive" "$output/"
-echo "Distribution install passed for $revision ($version). SHA-256 and artifact path:"
-sha256sum "$output/$archive_name.zip"
+echo "Distribution install passed for $revision ($version, $mode)."
+if [[ $mode == local ]]; then
+    output=$(mktemp -d)
+    cp "$archive" "$output/"
+    echo 'SHA-256 and artifact path:'
+    sha256sum "$output/$archive_name.zip"
+fi
