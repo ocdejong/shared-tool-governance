@@ -7,21 +7,21 @@ namespace Ocdejong\SharedToolGovernance\Approvals;
 use DomainException;
 use Illuminate\Support\Facades\DB;
 use Ocdejong\SharedToolGovernance\Authorization\FrozenCall;
-use Ocdejong\SharedToolGovernance\Contracts\ToolExecutor;
 use Ocdejong\SharedToolGovernance\Data\ExecutionStatus;
+use Ocdejong\SharedToolGovernance\Execution\ExecuteTool;
+use Ocdejong\SharedToolGovernance\Grants\GrantClock;
 use Ocdejong\SharedToolGovernance\Grants\GrantService;
 use Ocdejong\SharedToolGovernance\Grants\RedemptionRefused;
 use Ocdejong\SharedToolGovernance\Models\GovernanceGrant;
 use Ocdejong\SharedToolGovernance\Models\GovernanceInvocation;
 use SensitiveParameter;
-use Throwable;
 
 /** @internal */
 final readonly class ApprovalResumption
 {
     public function __construct(
         private ApprovalPolicy $approvals,
-        private ToolExecutor $executor,
+        private ExecuteTool $executor,
     ) {}
 
     public function resume(int $rowId): void
@@ -40,17 +40,7 @@ final readonly class ApprovalResumption
             return;
         }
 
-        try {
-            $result = $this->executor->execute($frozen->call, $frozen->targets);
-        } catch (Throwable) {
-            // Once the executor starts, an exception cannot establish that it had no effect.
-            return;
-        }
-
-        DB::transaction(static function () use ($rowId, $result): void {
-            $row = ApprovalStore::locked($rowId) ?? throw new DomainException('Redeemed invocation is missing.');
-            GrantService::recordLockedOutcome($row, $result->status, $result->providerReference);
-        }, 3);
+        $this->executor->run($rowId, $frozen->call, $frozen->targets);
     }
 
     private function issue(int $rowId): ?string
@@ -134,8 +124,12 @@ final readonly class ApprovalResumption
             return;
         }
 
-        $grant = GovernanceGrant::query()->where('invocation_row_id', $row->getKey())->where('redeemed_at', null)->first();
-        if ($grant !== null && ($grant->getAttribute('revoked_at') !== null || $grant->getAttribute('expires_at') <= now())) {
+        $expiredOrRevoked = GovernanceGrant::query()
+            ->where('invocation_row_id', $row->getKey())
+            ->whereNull('redeemed_at')
+            ->where(fn ($query) => $query->whereNotNull('revoked_at')->orWhereRaw('expires_at <= '.GrantClock::sql()))
+            ->exists();
+        if ($expiredOrRevoked) {
             $this->markUnused($row);
         }
     }

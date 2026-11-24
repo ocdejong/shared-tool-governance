@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Ocdejong\SharedToolGovernance\Tests\Approvals;
 
+use Illuminate\Support\Facades\DB;
 use Ocdejong\SharedToolGovernance\Approvals\ApprovalPreview;
 use Ocdejong\SharedToolGovernance\Contracts\ApprovalNotifier;
 use Ocdejong\SharedToolGovernance\Contracts\ResourceAuthority;
@@ -47,6 +48,8 @@ final class ApprovalHost implements ResourceAuthority, ResumptionContext, RuleEv
 
     public bool $denyAtRedemption = false;
 
+    public ?string $ownerAtRedemption = null;
+
     public bool $timeout = false;
 
     public int $checksAfterApproval = 0;
@@ -61,10 +64,11 @@ final class ApprovalHost implements ResourceAuthority, ResumptionContext, RuleEv
 
     public function bind(string $executorId = 'worker'): void
     {
-        foreach ([ResourceAuthority::class, ResumptionContext::class, RuleEvaluator::class, ToolExecutor::class, TrustedInvocationContext::class] as $contract) {
+        foreach ([ResourceAuthority::class, ResumptionContext::class, RuleEvaluator::class, TrustedInvocationContext::class] as $contract) {
             app()->instance($contract, $this);
         }
 
+        app()->instance($executorId, $this);
         app()->instance(ApprovalNotifier::class, $this->inbox);
         $tools = new ToolRegistry;
         $tools->register(new ToolDefinition(
@@ -88,11 +92,11 @@ final class ApprovalHost implements ResourceAuthority, ResumptionContext, RuleEv
         app()->instance(ToolRegistry::class, $tools);
     }
 
-    public function call(string $id = 'visit', bool $two = false): Invocation
+    public function call(string $id = 'visit', bool $two = false, string $executor = 'worker'): Invocation
     {
         return new Invocation(
             $id, 'reschedule', '1', ['two' => $two, 'scheduled_time' => '10:00', 'private_note' => 'hidden detail'],
-            'Move the repair visit (hidden detail)', $this->context, 'worker',
+            'Move the repair visit (hidden detail)', $this->context, $executor,
         );
     }
 
@@ -114,6 +118,7 @@ final class ApprovalHost implements ResourceAuthority, ResumptionContext, RuleEv
                 throw new RuntimeException('Worker stopped after issuance.');
             }
 
+            $this->personalOwner = $this->ownerAtRedemption ?? $this->personalOwner;
             if ($this->denyAtRedemption) {
                 $this->deny = true;
             }
@@ -153,6 +158,7 @@ final class ApprovalHost implements ResourceAuthority, ResumptionContext, RuleEv
 
     public function execute(Invocation $frozenCall, array $approvedTargets): ExecutionResult
     {
+        expect(DB::transactionLevel())->toBe(0);
         $this->executions[] = $frozenCall;
         if ($this->timeout) {
             throw new RuntimeException('Executor timed out.');

@@ -4,12 +4,17 @@ declare(strict_types=1);
 
 namespace Ocdejong\SharedToolGovernance\Tests\Authorization;
 
+use Closure;
+use Illuminate\Support\Facades\DB;
 use InvalidArgumentException;
 use Ocdejong\SharedToolGovernance\Authorization\Authorizer;
 use Ocdejong\SharedToolGovernance\Authorization\CallPolicy;
 use Ocdejong\SharedToolGovernance\Contracts\ResourceAuthority;
 use Ocdejong\SharedToolGovernance\Contracts\RuleEvaluator;
+use Ocdejong\SharedToolGovernance\Contracts\ToolExecutor;
 use Ocdejong\SharedToolGovernance\Contracts\TrustedInvocationContext;
+use Ocdejong\SharedToolGovernance\Data\ExecutionResult;
+use Ocdejong\SharedToolGovernance\Data\ExecutionStatus;
 use Ocdejong\SharedToolGovernance\Data\Invocation;
 use Ocdejong\SharedToolGovernance\Data\InvocationContext;
 use Ocdejong\SharedToolGovernance\Data\OwnerReference;
@@ -22,7 +27,7 @@ use Ocdejong\SharedToolGovernance\Data\Verdict;
 use Ocdejong\SharedToolGovernance\Grants\GrantService;
 use Ocdejong\SharedToolGovernance\Tools\ToolRegistry;
 
-final class Fixture implements ResourceAuthority, RuleEvaluator, TrustedInvocationContext
+final class Fixture implements ResourceAuthority, RuleEvaluator, ToolExecutor, TrustedInvocationContext
 {
     public ToolRegistry $tools;
 
@@ -35,6 +40,18 @@ final class Fixture implements ResourceAuthority, RuleEvaluator, TrustedInvocati
     public string $owner = 'person-2';
 
     public bool $membersActive = true;
+
+    public ?string $householdOwner = null;
+
+    public ?Closure $onEvaluate = null;
+
+    public ExecutionStatus $outcome = ExecutionStatus::SUCCEEDED;
+
+    /** @var list<Invocation> */
+    public array $executions = [];
+
+    /** @var list<string> */
+    public array $executedTargets = [];
 
     public int $evaluations = 0;
 
@@ -57,7 +74,7 @@ final class Fixture implements ResourceAuthority, RuleEvaluator, TrustedInvocati
 
                 return $arguments + ['timezone' => 'Europe/Amsterdam'];
             },
-            resolveTargets: static fn (array $arguments, InvocationContext $context): array => [
+            resolveTargets: static fn (array $arguments, InvocationContext $context): array => ($arguments['no_targets'] ?? false) === true ? [] : [
                 new ResourceReference('item', 'item-1', 'r1'),
                 new ResourceReference('item', is_string($arguments['also'] ?? null) ? $arguments['also'] : 'item-2', 'r1'),
             ],
@@ -67,7 +84,10 @@ final class Fixture implements ResourceAuthority, RuleEvaluator, TrustedInvocati
         ));
         $policy = new CallPolicy($this->tools, $this, $this, $this);
         $this->authorizer = new Authorizer($policy);
-        $this->grants = new GrantService($policy, $this);
+        app()->instance(CallPolicy::class, $policy);
+        app()->instance(TrustedInvocationContext::class, $this);
+        app()->instance('items-worker', $this);
+        $this->grants = app(GrantService::class);
     }
 
     /** @param array<string, mixed> $arguments */
@@ -97,7 +117,7 @@ final class Fixture implements ResourceAuthority, RuleEvaluator, TrustedInvocati
     {
         return match ($resource->id) {
             'item-1' => new OwnerReference(OwnerType::PERSON, $this->owner),
-            'item-2' => new OwnerReference(OwnerType::HOUSEHOLD, $scope->householdId),
+            'item-2' => new OwnerReference(OwnerType::HOUSEHOLD, $this->householdOwner ?? $scope->householdId),
             default => null,
         };
     }
@@ -115,7 +135,19 @@ final class Fixture implements ResourceAuthority, RuleEvaluator, TrustedInvocati
     public function evaluate(Scope $scope, ResourceReference $resource, OwnerReference $owner, string $actionKey): RuleEvaluation
     {
         $this->evaluations++;
+        if ($this->onEvaluate !== null) {
+            ($this->onEvaluate)();
+        }
 
         return new RuleEvaluation($this->verdicts[$resource->id] ?? Verdict::ALLOW, $actionKey, 3, 'Fixture policy');
+    }
+
+    public function execute(Invocation $frozenCall, array $approvedTargets): ExecutionResult
+    {
+        expect(DB::transactionLevel())->toBe(0);
+        $this->executions[] = $frozenCall;
+        $this->executedTargets = array_column($approvedTargets, 'id');
+
+        return new ExecutionResult($this->outcome);
     }
 }

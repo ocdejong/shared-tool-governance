@@ -10,9 +10,11 @@ use InvalidArgumentException;
 use Ocdejong\SharedToolGovernance\Authorization\CallPolicy;
 use Ocdejong\SharedToolGovernance\Authorization\InvocationStore;
 use Ocdejong\SharedToolGovernance\Contracts\TrustedInvocationContext;
+use Ocdejong\SharedToolGovernance\Data\ExecutionResult;
 use Ocdejong\SharedToolGovernance\Data\ExecutionStatus;
 use Ocdejong\SharedToolGovernance\Data\Invocation;
 use Ocdejong\SharedToolGovernance\Data\Verdict;
+use Ocdejong\SharedToolGovernance\Execution\ExecuteTool;
 use Ocdejong\SharedToolGovernance\Models\GovernanceGrant;
 use Ocdejong\SharedToolGovernance\Models\GovernanceInvocation;
 use SensitiveParameter;
@@ -21,22 +23,30 @@ final readonly class GrantService
 {
     private const int LIFETIME_MINUTES = 5;
 
-    public function __construct(private CallPolicy $policy, private TrustedInvocationContext $context) {}
+    public function __construct(
+        private CallPolicy $policy,
+        private TrustedInvocationContext $context,
+        private ExecuteTool $executor,
+    ) {}
 
     /** @internal Call in the same transaction that grants the invocation. */
     public static function issue(GovernanceInvocation $invocation): string
     {
         $token = bin2hex(random_bytes(32));
-        GovernanceGrant::query()->forceCreate([
+        $now = DB::raw(GrantClock::sql());
+        GovernanceGrant::query()->insert([
             'invocation_row_id' => $invocation->getKey(),
             'token_hash' => hash('sha256', $token),
-            'expires_at' => now()->addMinutes(self::LIFETIME_MINUTES),
+            'expires_at' => DB::raw(GrantClock::sql(self::LIFETIME_MINUTES)),
+            'created_at' => $now,
+            'updated_at' => $now,
         ]);
 
         return $token;
     }
 
-    public function redeem(#[SensitiveParameter] string $grant, Invocation $actualCall): Redemption
+    /** Consume the matching grant before running the registered executor. */
+    public function redeem(#[SensitiveParameter] string $grant, Invocation $actualCall): ExecutionResult
     {
         if (DB::transactionLevel() !== 0) {
             throw new DomainException('Redemption must commit before the executor can act.');
@@ -49,14 +59,14 @@ final readonly class GrantService
             throw new RedemptionRefused;
         }
 
-        $invocations = InvocationStore::query($frozen->call->context->scope, $actualCall->id);
-        $invocations->getQuery()->useWritePdo();
-        $row = $invocations->first();
-        if ($row === null || $row->getAttribute('status') !== 'granted' || $row->getAttribute('fingerprint') !== $fingerprint) {
-            throw new RedemptionRefused;
-        }
+        $redemption = DB::transaction(function () use ($frozen, $fingerprint, $grant): Redemption {
+            $query = InvocationStore::query($frozen->call->context->scope, $frozen->call->id);
+            $query->getQuery()->lockForUpdate();
+            $row = $query->first();
+            if ($row === null || $row->getAttribute('status') !== 'granted' || $row->getAttribute('fingerprint') !== $fingerprint) {
+                throw new RedemptionRefused;
+            }
 
-        return DB::transaction(function () use ($row, $frozen, $grant): Redemption {
             $locked = self::lockForRedemption($row, $grant);
             $decisions = $this->policy->evaluate($frozen);
             if ($decisions === null || array_diff(array_column($decisions, 'verdict'), [Verdict::ALLOW->value]) !== []) {
@@ -83,12 +93,16 @@ final readonly class GrantService
             }
 
             self::consume($row, $locked, array_column($decisions, 'rule_revision'));
+            // A crash after redemption leaves the downstream outcome unknown.
+            self::recordLockedOutcome($row, ExecutionStatus::UNKNOWN);
 
             $call = $frozen->call;
             $approvedCall = new Invocation($call->id, $call->toolName, $call->toolVersion, $arguments, $call->reason, $call->context, $call->executorId);
 
-            return new Redemption($approvedCall, $frozen->targets);
+            return new Redemption((int) $row->getKey(), $approvedCall, $frozen->targets);
         }, 3);
+
+        return $this->executor->run($redemption->rowId, $redemption->call, $redemption->targets);
     }
 
     /** @internal Lock before evaluating the current authority for redemption. */
@@ -99,9 +113,9 @@ final readonly class GrantService
             ->where('token_hash', hash('sha256', $grant))
             ->where('revoked_at', null)
             ->where('redeemed_at', null);
-        $query->getQuery()->lockForUpdate();
+        $query->getQuery()->whereRaw(DB::raw('expires_at > '.GrantClock::sql()))->lockForUpdate();
         $locked = $query->first();
-        if ($locked === null || $locked->getAttribute('expires_at') <= now()) {
+        if ($locked === null) {
             throw new RedemptionRefused;
         }
 
@@ -115,13 +129,13 @@ final readonly class GrantService
      */
     public static function consume(GovernanceInvocation $row, GovernanceGrant $locked, array $ruleRevisions): void
     {
-        $now = now();
+        $now = GrantClock::sql();
         $updated = GovernanceGrant::query()->whereKey($locked->getKey())
             ->where('invocation_row_id', $row->getKey())
             ->where('revoked_at', null)
             ->where('redeemed_at', null)
-            ->where('expires_at', '>', $now)
-            ->update(['redeemed_at' => $now]);
+            ->whereRaw(DB::raw('expires_at > '.$now))
+            ->update(['redeemed_at' => DB::raw($now), 'updated_at' => DB::raw($now)]);
         if ($updated !== 1) {
             throw new RedemptionRefused;
         }

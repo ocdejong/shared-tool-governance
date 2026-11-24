@@ -11,6 +11,7 @@ use Ocdejong\SharedToolGovernance\Approvals\Approvals;
 use Ocdejong\SharedToolGovernance\Authorization\Authorizer;
 use Ocdejong\SharedToolGovernance\Contracts\ApprovalNotifier;
 use Ocdejong\SharedToolGovernance\Contracts\RuleEvaluator;
+use Ocdejong\SharedToolGovernance\Contracts\ToolExecutor;
 use Ocdejong\SharedToolGovernance\Data\InvocationContext;
 use Ocdejong\SharedToolGovernance\Data\ResourceReference;
 use Ocdejong\SharedToolGovernance\Data\Scope;
@@ -20,6 +21,7 @@ use Ocdejong\SharedToolGovernance\Jobs\DeliverApproval;
 use Ocdejong\SharedToolGovernance\Jobs\ResumeApproval;
 use Ocdejong\SharedToolGovernance\LocalInbox\LocalInbox;
 use Ocdejong\SharedToolGovernance\Models\GovernanceApproval;
+use Ocdejong\SharedToolGovernance\Models\GovernanceGrant;
 use Ocdejong\SharedToolGovernance\Models\GovernanceInvocation;
 use Ocdejong\SharedToolGovernance\Models\GovernanceOutboxMessage;
 use Ocdejong\SharedToolGovernance\Outbox\ApprovalDelivery;
@@ -195,9 +197,11 @@ it('reports an approved grant that expired unused after the worker stopped', fun
     $host->interrupt = true;
     expect(resumeApproved(...))->toThrow(RuntimeException::class, 'Worker stopped after issuance.');
 
-    $this->travel(6)->minutes();
+    DB::table('governance_grants')->update(['expires_at' => now()->subDay()]);
+    $this->travel(-3)->days();
     $host->interrupt = false;
     app(ApprovalWork::class)->recover();
+    Queue::assertPushed(ResumeApproval::class, 2);
     resumeApproved();
     expect($host->executions)->toBe([])
         ->and(app(Approvals::class)->receipt('visit'))->toBe(['status' => 'approved_unused']);
@@ -349,3 +353,81 @@ it('removes private card content and execution arguments after use', function (s
         ->and($invocation->refresh()->getAttribute('frozen_inputs'))->not->toHaveKey('arguments_json')
         ->toHaveKeys(['targets', 'decisions', 'approval_requirements']);
 })->with(['granted', 'declined', 'expired']);
+
+it('resumes with the registered executor even when the proposal names a different binding', function (): void {
+    $host = new ApprovalHost;
+    $host->bind();
+    $this->mock(ToolExecutor::class)->shouldNotReceive('execute');
+    app()->instance('caller-worker', app(ToolExecutor::class));
+
+    expect(app(Authorizer::class)->authorize($host->call(executor: 'caller-worker'))->status)->toBe('pending_approval');
+    Queue::pushed(DeliverApproval::class)
+        ->each(static fn (DeliverApproval $job) => $job->handle(app(ApprovalDelivery::class)));
+    expect(decideFromInbox($host, 'alice'))->toBeTrue();
+    resumeApproved();
+
+    expect($host->executions)->toHaveCount(1)
+        ->and($host->executions[0]->executorId)->toBe('worker');
+});
+
+it('refuses a resumed grant when ownership changes after issuance', function (): void {
+    $host = new ApprovalHost;
+    requestApproval($host);
+    expect(decideFromInbox($host, 'alice'))->toBeTrue();
+    $host->checksAfterApproval = 0;
+    $host->ownerAtRedemption = 'bob';
+
+    resumeApproved();
+
+    expect($host->executions)->toBe([])
+        ->and(GovernanceGrant::query()->sole()->getAttribute('redeemed_at'))->toBeNull()
+        ->and(app(Approvals::class)->receipt('visit'))->toBe(['status' => 'approved_unused']);
+});
+
+it('refuses mismatched grant tokens when resuming approved work', function (string $source): void {
+    $host = new ApprovalHost;
+    requestApproval($host);
+    expect(decideFromInbox($host, 'alice'))->toBeTrue();
+    $host->checksAfterApproval = 0;
+
+    $original = $host->context;
+    $otherRowId = null;
+    if ($source !== 'wrong token') {
+        if ($source === 'another household') {
+            $host->context = new InvocationContext(new Scope('tenant', 'other-home'), 'requester', 'runtime', ['requester']);
+        }
+
+        $other = $host->call(id: $source === 'another household' ? 'visit' : 'other-visit');
+        app(Authorizer::class)->authorize($other);
+        $otherRowId = GovernanceInvocation::query()->latest('id')->value('id');
+        $host->context = $original;
+    }
+
+    $transactions = 0;
+    DB::connection()->beforeStartingTransaction(static function () use ($otherRowId, &$transactions): void {
+        if (++$transactions !== 2) {
+            return;
+        }
+
+        $issued = DB::table('governance_grants')->sole();
+        if ($otherRowId === null) {
+            DB::table('governance_grants')->where('id', $issued->id)
+                ->update(['token_hash' => str_repeat('0', 64)]);
+
+            return;
+        }
+
+        DB::table('governance_grants')->where('id', $issued->id)->update(['invocation_row_id' => $otherRowId]);
+        DB::table('governance_grants')->insert([
+            'invocation_row_id' => $issued->invocation_row_id,
+            'token_hash' => str_repeat('0', 64),
+            'expires_at' => $issued->expires_at,
+        ]);
+    });
+
+    resumeApproved();
+
+    expect($host->executions)->toBe([])
+        ->and(GovernanceGrant::query()->whereNotNull('redeemed_at')->count())->toBe(0)
+        ->and(app(Approvals::class)->receipt('visit'))->toBe(['status' => 'approved_unused']);
+})->with(['wrong token', 'another invocation', 'another household']);

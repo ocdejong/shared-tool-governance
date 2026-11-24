@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\DB;
 use Ocdejong\SharedToolGovernance\Contracts\ResourceAuthority;
 use Ocdejong\SharedToolGovernance\Contracts\RuleEvaluator;
 use Ocdejong\SharedToolGovernance\Contracts\TrustedInvocationContext;
@@ -112,3 +113,23 @@ it('resolves the evaluator contract through the Laravel package provider', funct
 
     expect(app(RuleEvaluator::class))->toBeInstanceOf(ResourceRules::class);
 });
+
+it('refuses a stored binding owned by someone other than the verified owner', function (string $operation): void {
+    $host = new RulesHost;
+    $scope = $host->current()->scope;
+    $resource = new ResourceReference('calendar', 'tom');
+    $rules = new ResourceRules($host, $host);
+    $rules->setRules($scope, $resource, 0, ['rules' => ['calendar' => Verdict::ALLOW]]);
+    DB::table('governance_resource_bindings')->update(['owner_id' => 'pauline']);
+
+    if ($operation === 'evaluate') {
+        expect($rules->evaluate($scope, $resource, new OwnerReference(OwnerType::PERSON, 'tom'), 'calendar')->verdict)->toBe(Verdict::DENY);
+
+        return;
+    }
+
+    $attempt = $operation === 'getRules'
+        ? fn () => $rules->getRules($scope, $resource)
+        : fn () => $rules->setRules($scope, $resource, 1, ['enabled' => false]);
+    expect($attempt)->toThrow(RuleAccessDenied::class, 'The stored rules belong to a different owner.');
+})->with(['evaluate', 'getRules', 'setRules']);

@@ -30,7 +30,7 @@ final readonly class CallPolicy
 
     public function freeze(Invocation $proposal): FrozenCall
     {
-        if (preg_match('/\S/u', $proposal->reason) !== 1) {
+        if (preg_match('/[^\s\p{C}\p{Default_Ignorable_Code_Point}]/u', $proposal->reason) !== 1) {
             throw new InvalidArgumentException('A non-blank reason is required.');
         }
 
@@ -49,13 +49,12 @@ final readonly class CallPolicy
         $audience = self::audience($trusted);
         if (
             $proposal->id === ''
-            || $proposal->executorId !== $tool->executorId
             || ! $proposal->context->scope->equals($trusted->scope)
             || $proposal->context->requesterId !== $trusted->requesterId
             || $proposal->context->runtimeId !== $trusted->runtimeId
             || self::audience($proposal->context) !== $audience
         ) {
-            throw new InvalidArgumentException('Call does not match the registered executor or trusted context.');
+            throw new InvalidArgumentException('Call does not match trusted context.');
         }
 
         $context = new InvocationContext($trusted->scope, $trusted->requesterId, $trusted->runtimeId, $audience);

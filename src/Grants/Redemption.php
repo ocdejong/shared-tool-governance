@@ -7,8 +7,9 @@ namespace Ocdejong\SharedToolGovernance\Grants;
 use Ocdejong\SharedToolGovernance\Data\Invocation;
 use Ocdejong\SharedToolGovernance\Data\ResourceReference;
 
+/** @internal */
 final readonly class Redemption
 {
     /** @param list<ResourceReference> $targets */
-    public function __construct(public Invocation $call, public array $targets) {}
+    public function __construct(public int $rowId, public Invocation $call, public array $targets) {}
 }

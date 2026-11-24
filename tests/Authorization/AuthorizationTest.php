@@ -5,6 +5,7 @@ declare(strict_types=1);
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Ocdejong\SharedToolGovernance\Authorization\InvocationConflict;
+use Ocdejong\SharedToolGovernance\Contracts\ToolExecutor;
 use Ocdejong\SharedToolGovernance\Data\ExecutionStatus;
 use Ocdejong\SharedToolGovernance\Data\InvocationContext;
 use Ocdejong\SharedToolGovernance\Data\Scope;
@@ -27,11 +28,11 @@ it('rejects invalid requests and out-of-scope resources before evaluating rules'
 
     foreach ([
         $fixture->call(reason: "\u{00A0}\t"),
+        $fixture->call(reason: "\u{200B}\u{2060}\u{FEFF}\u{FE0F}\u{034F}"),
         $fixture->call(tool: 'unknown'),
         $fixture->call(version: '2'),
         $fixture->call(arguments: []),
         $fixture->call(context: $outside),
-        $fixture->call(executor: 'other-worker'),
     ] as $call) {
         expect(fn () => $fixture->authorizer->authorize($call))->toThrow(InvalidArgumentException::class);
     }
@@ -96,20 +97,25 @@ it('keeps the opaque token out of serialization, database bindings, and audit da
         ->and(DB::table('governance_invocations')->value('frozen_inputs'))->not->toContain('Europe/Amsterdam');
 });
 
-it('matches the approved call, executor and audience and consumes it once', function (): void {
+it('runs the registered executor once after matching the approved call and audience', function (): void {
     $fixture = new Fixture;
-    $call = $fixture->call();
+    $this->mock(ToolExecutor::class)->shouldNotReceive('execute');
+    app()->instance('other-worker', app(ToolExecutor::class));
+    $call = $fixture->call(executor: 'other-worker');
     $token = $fixture->authorizer->authorize($call)->grantToken() ?? throw new LogicException('Expected a token.');
 
     expect(fn () => $fixture->grants->redeem($token, $fixture->call(arguments: ['date' => '2026-11-26'])))->toThrow(RedemptionRefused::class);
-    expect(fn () => $fixture->grants->redeem($token, $fixture->call(executor: 'other-worker')))->toThrow(RedemptionRefused::class);
     $fixture->context = new InvocationContext($call->context->scope, 'person-1', 'agent-1', ['person-1']);
     expect(fn () => $fixture->grants->redeem($token, $fixture->call()))->toThrow(RedemptionRefused::class);
     $fixture->context = $call->context;
 
-    $redemption = $fixture->grants->redeem($token, $call);
-    expect($redemption->call->arguments)->toBe(['date' => '2026-11-25', 'timezone' => 'Europe/Amsterdam'])
-        ->and(array_column($redemption->targets, 'id'))->toBe(['item-1', 'item-2']);
+    expect($fixture->executions)->toBe([]);
+    expect($fixture->grants->redeem($token, $fixture->call())->status)->toBe(ExecutionStatus::SUCCEEDED)
+        ->and($fixture->executions)->toHaveCount(1)
+        ->and($fixture->executions[0]->executorId)->toBe('items-worker')
+        ->and($fixture->executions[0]->arguments)->toBe(['date' => '2026-11-25', 'timezone' => 'Europe/Amsterdam'])
+        ->and($fixture->executedTargets)->toBe(['item-1', 'item-2'])
+        ->and(GovernanceInvocation::query()->sole()->getAttribute('outcome'))->toBe(ExecutionStatus::SUCCEEDED);
     expect(fn () => $fixture->grants->redeem($token, $call))->toThrow(RedemptionRefused::class);
 });
 
@@ -119,7 +125,8 @@ it('passes the stored normalized arguments to the executor with their original t
     $actual = $fixture->call(arguments: ['details' => ['a' => 1, 'b' => 1.0], 'date' => '2026-11-25']);
     $token = $fixture->authorizer->authorize($proposal)->grantToken() ?? throw new LogicException('Expected a token.');
 
-    expect($fixture->grants->redeem($token, $actual)->call->arguments)->toBe($proposal->arguments + ['timezone' => 'Europe/Amsterdam']);
+    $fixture->grants->redeem($token, $actual);
+    expect($fixture->executions[0]->arguments)->toBe($proposal->arguments + ['timezone' => 'Europe/Amsterdam']);
 });
 
 it('checks revocation, expiry, current ownership, membership and rules before consuming', function (string $change): void {
@@ -128,7 +135,7 @@ it('checks revocation, expiry, current ownership, membership and rules before co
     $token = $fixture->authorizer->authorize($call)->grantToken() ?? throw new LogicException('Expected a token.');
 
     match ($change) {
-        'expired' => $this->travel(6)->minutes(),
+        'expired' => DB::table('governance_grants')->update(['expires_at' => '2000-01-01 00:00:00']),
         'revoked' => GovernanceGrant::query()->update(['revoked_at' => now()]),
         'owner' => $fixture->owner = 'person-1',
         'membership' => $fixture->membersActive = false,
@@ -138,28 +145,34 @@ it('checks revocation, expiry, current ownership, membership and rules before co
     };
 
     expect(fn () => $fixture->grants->redeem($token, $call))->toThrow(RedemptionRefused::class)
-        ->and(GovernanceGrant::query()->sole()->getAttribute('redeemed_at'))->toBeNull();
+        ->and(GovernanceGrant::query()->sole()->getAttribute('redeemed_at'))->toBeNull()
+        ->and($fixture->executions)->toBe([]);
+    if ($change === 'expired') {
+        expect($fixture->evaluations)->toBe(2);
+    }
 })->with(['expired', 'revoked', 'owner', 'membership', 'denied', 'delegated']);
 
-it('requires redemption to commit before releasing the approved call', function (): void {
+it('requires redemption to commit before executing the approved call', function (): void {
     $fixture = new Fixture;
     $call = $fixture->call();
     $token = $fixture->authorizer->authorize($call)->grantToken() ?? throw new LogicException('Expected a token.');
 
     expect(fn () => DB::transaction(fn () => $fixture->grants->redeem($token, $call)))
         ->toThrow(DomainException::class, 'Redemption must commit before the executor can act.');
-    expect($fixture->grants->redeem($token, $call)->call->id)->toBe($call->id);
+    expect($fixture->executions)->toBe([]);
+    $fixture->grants->redeem($token, $call);
+    expect($fixture->executions[0]->id)->toBe($call->id);
 });
 
-it('records a downstream outcome independently of redemption and deduplicates identical reports', function (): void {
+it('reconciles an unknown downstream outcome and deduplicates identical reports', function (): void {
     $fixture = new Fixture;
     $call = $fixture->call();
     $token = $fixture->authorizer->authorize($call)->grantToken() ?? throw new LogicException('Expected a token.');
 
     expect(fn () => $fixture->grants->recordOutcome($call->id, ExecutionStatus::UNKNOWN))->toThrow(DomainException::class);
+    $fixture->outcome = ExecutionStatus::UNKNOWN;
     $fixture->grants->redeem($token, $call);
 
-    expect(GovernanceInvocation::query()->sole()->getAttribute('outcome'))->toBeNull();
     $fixture->grants->recordOutcome($call->id, ExecutionStatus::UNKNOWN);
     $fixture->grants->recordOutcome($call->id, ExecutionStatus::UNKNOWN);
 
@@ -197,13 +210,13 @@ it('lets exactly one of two PostgreSQL connections redeem the same grant', funct
 
     $atLock = false;
     DB::connection()->beforeExecuting(static function (string $sql) use ($socket, &$atLock): void {
-        if ($atLock || ! str_contains($sql, '"governance_grants"') || ! str_contains($sql, 'for update')) {
+        if ($atLock || ! str_contains($sql, '"governance_invocations"') || ! str_contains($sql, 'for update')) {
             return;
         }
 
         $atLock = true;
         if (fwrite($socket, 'R') !== 1 || fread($socket, 1) !== 'R') {
-            throw new RuntimeException('Both connections must reach the grant lock.');
+            throw new RuntimeException('Both connections must reach the invocation lock.');
         }
     });
 
@@ -233,4 +246,123 @@ it('lets exactly one of two PostgreSQL connections redeem the same grant', funct
         ->and(pcntl_wexitstatus($status))->toBe(0)
         ->and(in_array($result.$peer, ['GD', 'DG'], true))->toBeTrue()
         ->and(DB::table('governance_audit_events')->where('event', 'redeemed')->count())->toBe(1);
+});
+
+it('denies invalid targets or audience before evaluating any rules', function (string $change): void {
+    $fixture = new Fixture;
+    $arguments = ['date' => '2026-11-25'];
+    match ($change) {
+        'no targets' => $arguments['no_targets'] = true,
+        'foreign household owner' => $fixture->householdOwner = 'other-household',
+        'audience member only' => $fixture->context = new InvocationContext(
+            $fixture->context->scope, 'person-1', 'agent-1', ['person-1', 'outsider'],
+        ),
+        default => throw new LogicException('Unknown fixture change.'),
+    };
+
+    expect($fixture->authorizer->authorize($fixture->call(arguments: $arguments))->status)->toBe('denied')
+        ->and($fixture->evaluations)->toBe(0)
+        ->and(GovernanceGrant::query()->count())->toBe(0)
+        ->and($fixture->executions)->toBe([]);
+})->with(['no targets', 'foreign household owner', 'audience member only']);
+
+it('returns the winning authorization after a concurrent insert', function (bool $sameCall): void {
+    $fixture = new Fixture;
+    $attempted = false;
+    $winner = null;
+    DB::connection()->beforeStartingTransaction(function () use ($fixture, $sameCall, &$attempted, &$winner): void {
+        if ($attempted) {
+            return;
+        }
+
+        $attempted = true;
+        $winner = $fixture->authorizer->authorize($fixture->call(reason: $sameCall ? 'Move the repair visit' : 'A different reason'));
+    });
+
+    if ($sameCall) {
+        $retry = $fixture->authorizer->authorize($fixture->call());
+        expect($retry->status)->toBe('granted')->and($retry->grantToken())->toBeNull();
+    } else {
+        expect(fn () => $fixture->authorizer->authorize($fixture->call()))->toThrow(InvocationConflict::class);
+    }
+
+    expect($winner?->grantToken())->toBeString()
+        ->and(GovernanceInvocation::query()->count())->toBe(1)
+        ->and(GovernanceGrant::query()->count())->toBe(1);
+})->with([true, false]);
+
+it('refuses a token that does not belong to the exact scoped invocation', function (string $source): void {
+    $fixture = new Fixture;
+    $call = $fixture->call();
+    $ownToken = $fixture->authorizer->authorize($call)->grantToken() ?? throw new LogicException('Expected a token.');
+    $token = str_repeat('0', 64);
+    if ($source !== 'wrong token') {
+        if ($source === 'another household') {
+            $fixture->context = new InvocationContext(new Scope('tenant-1', 'home-2'), 'person-1', 'agent-1', ['person-1', 'person-2']);
+        }
+
+        $otherCall = $fixture->call(id: $source === 'another household' ? $call->id : 'call-2');
+        $token = $fixture->authorizer->authorize($otherCall)->grantToken() ?? throw new LogicException('Expected a token.');
+        $fixture->context = $call->context;
+    }
+
+    expect(fn () => $fixture->grants->redeem($token, $call))->toThrow(RedemptionRefused::class)
+        ->and($fixture->executions)->toBe([])
+        ->and(GovernanceGrant::query()->whereNotNull('redeemed_at')->count())->toBe(0);
+    expect($fixture->grants->redeem($ownToken, $call)->status)->toBe(ExecutionStatus::SUCCEEDED);
+})->with(['wrong token', 'another invocation', 'another household']);
+
+it('uses the database clock for grant issuance and redemption in a non-UTC PostgreSQL session', function (): void {
+    if (DB::connection()->getDriverName() !== 'pgsql') {
+        $this->markTestSkipped('Requires the dedicated PostgreSQL test database.');
+    }
+
+    DB::statement("SET TIME ZONE 'America/New_York'");
+    $fixture = new Fixture;
+    $call = $fixture->call();
+    $this->travel(1)->days();
+    $token = $fixture->authorizer->authorize($call)->grantToken() ?? throw new LogicException('Expected a token.');
+    expect((int) DB::table('governance_grants')
+        ->selectRaw('extract(epoch from expires_at - clock_timestamp()) as lifetime')->value('lifetime'))
+        ->toBeBetween(295, 301);
+
+    $fixture->grants->redeem($token, $call);
+    expect($fixture->executions)->toHaveCount(1)
+        ->and((int) DB::table('governance_grants')
+            ->selectRaw('abs(extract(epoch from clock_timestamp() - redeemed_at)) as age')->value('age'))->toBeLessThan(5);
+
+    $this->travelBack();
+    $this->travel(-1)->days();
+    $expiredCall = $fixture->call(id: 'expired-call');
+    $expiredToken = $fixture->authorizer->authorize($expiredCall)->grantToken() ?? throw new LogicException('Expected a token.');
+    $expiredRow = GovernanceInvocation::query()->where('invocation_id', 'expired-call')->sole();
+    DB::table('governance_grants')->where('invocation_row_id', $expiredRow->getKey())
+        ->update(['expires_at' => DB::raw("clock_timestamp() - interval '1 second'")]);
+
+    expect(fn () => $fixture->grants->redeem($expiredToken, $expiredCall))->toThrow(RedemptionRefused::class)
+        ->and($fixture->executions)->toHaveCount(1);
+});
+
+it('refuses a grant that expires between locking and consuming it', function (): void {
+    $fixture = new Fixture;
+    $call = $fixture->call();
+    $token = $fixture->authorizer->authorize($call)->grantToken() ?? throw new LogicException('Expected a token.');
+    $fixture->onEvaluate = static function (): void {
+        DB::table('governance_grants')->update(['expires_at' => '2000-01-01 00:00:00']);
+    };
+
+    expect(fn () => $fixture->grants->redeem($token, $call))->toThrow(RedemptionRefused::class)
+        ->and($fixture->executions)->toBe([])
+        ->and(GovernanceGrant::query()->sole()->getAttribute('redeemed_at'))->toBeNull();
+});
+
+it('requires the registered container entry to implement ToolExecutor', function (): void {
+    $fixture = new Fixture;
+    app()->instance('items-worker', new stdClass);
+    $call = $fixture->call();
+    $token = $fixture->authorizer->authorize($call)->grantToken() ?? throw new LogicException('Expected a token.');
+
+    expect(fn () => $fixture->grants->redeem($token, $call))
+        ->toThrow(InvalidArgumentException::class, 'The registered executor must implement ToolExecutor.')
+        ->and($fixture->executions)->toBe([]);
 });

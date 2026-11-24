@@ -8,6 +8,7 @@ use Ocdejong\SharedToolGovernance\Data\ExecutionResult;
 use Ocdejong\SharedToolGovernance\Data\Invocation;
 use Ocdejong\SharedToolGovernance\Data\ResourceReference;
 
+/** Bind the implementation in the host container under the registered tool's executorId. */
 interface ToolExecutor
 {
     /**
