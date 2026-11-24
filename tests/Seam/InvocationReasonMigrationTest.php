@@ -42,6 +42,7 @@ it('upgrades pre-change reasons, preserves pending approval and restores only re
     expect(Artisan::call('migrate', ['--realpath' => true, '--path' => [
         $directory.'/2026_11_24_000000_create_governance_tables.php',
         $directory.'/2026_11_24_000001_add_receipt_targets_to_governance_invocations.php',
+        $directory.'/2026_11_24_000005_add_eligible_approval_cards.php',
     ]]))->toBe(0, Artisan::output());
     $this->beforeApplicationDestroyed(function (): void {
         expect(Artisan::call('migrate:reset'))->toBe(0, Artisan::output());

@@ -125,11 +125,8 @@ it('uses the application clock for approvals across time zones', function (strin
     'New York app and Tokyo session' => ['America/New_York', 'Asia/Tokyo'],
 ]);
 
-it('delivers one private card per human and resumes only after all decisions', function (bool $two, bool $sameHuman): void {
+it('delivers one private card per requirement and resumes only after all decisions', function (bool $two): void {
     $host = new ApprovalHost;
-    if ($sameHuman) {
-        $host->householdApprover = 'alice';
-    }
 
     requestApproval($host, $two);
     $scope = $host->context->scope;
@@ -138,14 +135,14 @@ it('delivers one private card per human and resumes only after all decisions', f
     expect($alice)->toHaveCount(1)
         ->and($alice[0]->message)->toContain('Move the repair visit', 'personal', '09:00', '10:00', 'requester', 'Expires')
         ->and($host->inbox->cards($scope, 'requester'))->toBe([])
-        ->and($bob)->toHaveCount($two && ! $sameHuman ? 1 : 0);
+        ->and($bob)->toHaveCount($two ? 1 : 0);
     foreach ([...$alice, ...$bob] as $card) {
         $labels = array_map(static fn (string $line) => strstr($line, ':', true), explode("\n", $card->message));
         expect($labels)->toBe(['Requester', 'Reason', 'Scope and change', 'Audience', 'Expires'])
             ->and($card->message)->not->toContain('private reason marker')
             ->and($card->message)->not->toContain('private argument marker');
     }
-    if ($two && ! $sameHuman) {
+    if ($two) {
         expect($alice[0]->message)->not->toContain('shared')
             ->and($bob[0]->message)->toContain('shared')
             ->and($bob[0]->message)->not->toContain('personal');
@@ -154,7 +151,7 @@ it('delivers one private card per human and resumes only after all decisions', f
     expect($host->decideFromInbox('alice'))->toBeTrue()
         ->and($host->decideFromInbox('alice'))->toBeTrue()
         ->and($host->decideFromInbox('alice', ApprovalDecision::DECLINE))->toBeFalse();
-    if ($two && ! $sameHuman) {
+    if ($two) {
         ApprovalHost::runResumeJobs();
         expect($host->executions)->toBe([])
             ->and(app(Approvals::class)->receipt('visit'))->toBe(['status' => 'pending_approval']);
@@ -182,7 +179,7 @@ it('delivers one private card per human and resumes only after all decisions', f
         ->and(app(Approvals::class)->receipt('visit'))->toBe(['status' => 'granted', 'outcome' => 'success']);
     $worker->context = new InvocationContext($scope, 'alice', 'runtime', ['alice']);
     expect(app(Approvals::class)->receipt('visit'))->toBeNull();
-})->with([[false, false], [true, false], [true, true]]);
+})->with([false, true]);
 
 it('binds a decision to the verified scope, sender and original card', function (): void {
     $host = new ApprovalHost;
@@ -422,6 +419,7 @@ it('reports an unreachable owner after commit while the request keeps its expiry
     'empty approver' => ['', [], false],
     'approver outside the scope' => ['stranger', [], false],
     'approver is not the personal owner' => ['bob', ['personal' => 'bob'], false],
+    'same person for two owners' => ['alice', [], false],
     'conflicting approvers for one owner' => ['bob', ['personal' => 'alice'], true],
 ]);
 

@@ -6,10 +6,12 @@ namespace Ocdejong\SharedToolGovernance\Approvals;
 
 use Carbon\CarbonInterface;
 use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Str;
 use Ocdejong\SharedToolGovernance\Authorization\CallPolicy;
 use Ocdejong\SharedToolGovernance\Authorization\FrozenCall;
 use Ocdejong\SharedToolGovernance\Authorization\InvocationStore;
+use Ocdejong\SharedToolGovernance\Data\ApprovalMode;
 use Ocdejong\SharedToolGovernance\Data\Scope;
 use Ocdejong\SharedToolGovernance\Models\GovernanceApproval;
 use Ocdejong\SharedToolGovernance\Models\GovernanceInvocation;
@@ -30,46 +32,108 @@ final class ApprovalStore
         }
 
         $expires = self::expiresAt($row);
-        $cards = [];
-        foreach (array_unique(array_column($requirements, 'approver_id')) as $approver) {
-            $forApprover = array_filter($requirements, static fn (array $requirement): bool => $requirement['approver_id'] === $approver);
-            $targets = array_values(array_intersect_key($frozen->targets, $forApprover));
-            $preview = $previewFor($call, $targets, $approver);
-            if ($preview === null) {
-                throw new ApprovalSetupError($call->id, 'The approval preview callback returned null.');
-            }
-            if (Str::trim($preview->reason) === '' || Str::trim($preview->scopeAndChange) === '') {
-                throw new ApprovalSetupError($call->id, 'The approval preview requires text in both the reason and the scope and change fields.');
-            }
-
-            $cards[] = [$approver, $forApprover, self::render($frozen, $preview, $expires)];
+        $targetsByOwner = [];
+        $owners = [];
+        foreach ($requirements as $index => $requirement) {
+            $key = $requirement['owner_type'].':'.$requirement['owner_id'];
+            $owners[$key] = $requirement;
+            $targetsByOwner[$key][] = $frozen->targets[$index];
         }
 
-        foreach ($cards as [$approver, $forApprover, $message]) {
-            $cardApprovalId = (string) Str::ulid();
-            $seen = [];
-            foreach ($forApprover as $owner) {
-                $key = $owner['owner_type'].':'.$owner['owner_id'];
-                if (isset($seen[$key])) {
-                    continue;
+        foreach ($owners as $key => $owner) {
+            foreach ($owner['eligible_people'] ?? [$owner['approver_id']] as $person) {
+                $preview = $previewFor($call, $targetsByOwner[$key], $person);
+                if ($preview === null) {
+                    throw new ApprovalSetupError($call->id, 'The approval preview callback returned null.');
+                }
+                if (Str::trim($preview->reason) === '' || Str::trim($preview->scopeAndChange) === '') {
+                    throw new ApprovalSetupError($call->id, 'The approval preview requires text in both the reason and the scope and change fields.');
                 }
 
-                GovernanceApproval::query()->forceCreate($owner + [
-                    'invocation_row_id' => $row->getKey(),
-                    'approval_id' => $seen === [] ? $cardApprovalId : (string) Str::ulid(),
-                    'preview' => $seen === [] ? $message : null,
-                    'expires_at' => $expires,
-                ]);
-                $seen[$key] = true;
+                self::stageCard($row, $owner, $person, self::render($frozen, $preview, $expires));
+            }
+        }
+    }
+
+    /** @param Requirement $owner */
+    private static function stageCard(GovernanceInvocation $row, array $owner, string $person, string $message): void
+    {
+        $id = (string) Str::ulid();
+        GovernanceApproval::query()->forceCreate([
+            'invocation_row_id' => $row->getKey(),
+            'approval_id' => $id,
+            'owner_type' => $owner['owner_type'],
+            'owner_id' => $owner['owner_id'],
+            'approver_id' => $person,
+            'approval_mode' => $owner['mode'] ?? null,
+            'preview' => $message,
+            'expires_at' => self::expiresAt($row),
+        ]);
+
+        GovernanceOutboxMessage::query()->forceCreate([
+            'invocation_row_id' => $row->getKey(),
+            'delivery_id' => $id,
+            'recipient_id' => $person,
+            'payload' => $message,
+        ]);
+    }
+
+    public static function hasCombinedLegacyCard(GovernanceInvocation $row): bool
+    {
+        return self::approvals($row)->select('approver_id')->whereNull('approval_mode')
+            ->groupBy('approver_id')->havingRaw('count(*) > 1')->exists();
+    }
+
+    /** @param Collection<int, GovernanceApproval> $cards */
+    public static function settlement(Collection $cards): ?ApprovalDecision
+    {
+        $first = $cards->first();
+        if ($first === null) {
+            return null;
+        }
+
+        $votes = $cards->pluck('decision')->filter();
+        if ($first->getAttribute('approval_mode') === ApprovalMode::ANY) {
+            $winner = $votes->first();
+
+            return $winner === null ? null : ApprovalDecision::from($winner);
+        }
+        if ($votes->containsStrict(ApprovalDecision::DECLINE->value)) {
+            return ApprovalDecision::DECLINE;
+        }
+
+        return $votes->count() === $cards->count() ? ApprovalDecision::APPROVE : null;
+    }
+
+    public static function hasDistinctConsent(GovernanceInvocation $row): bool
+    {
+        $cards = self::approvals($row)->get();
+        $votes = $cards->where('decision', ApprovalDecision::APPROVE->value);
+        $requirements = $row->getAttribute('frozen_inputs')['approval_requirements'] ?? [];
+        if ($requirements === [] || $votes->pluck('approver_id')->duplicatesStrict()->isNotEmpty()) {
+            return false;
+        }
+
+        $byOwner = $cards->groupBy(static fn (GovernanceApproval $card): string => $card->getAttribute('owner_type')->value.':'.$card->getAttribute('owner_id'));
+        $checked = [];
+        foreach ($requirements as $requirement) {
+            $key = $requirement['owner_type'].':'.$requirement['owner_id'];
+            if (isset($checked[$key])) {
+                continue;
             }
 
-            GovernanceOutboxMessage::query()->forceCreate([
-                'invocation_row_id' => $row->getKey(),
-                'delivery_id' => $cardApprovalId,
-                'recipient_id' => $approver,
-                'payload' => $message,
-            ]);
+            $group = $byOwner->get($key);
+            $people = $requirement['eligible_people'] ?? [$requirement['approver_id']];
+            if ($group === null || $group->pluck('approver_id')->sort(SORT_STRING)->values()->all() !== $people
+                || $group->contains(static fn (GovernanceApproval $card): bool => $card->getAttribute('approval_mode')?->value !== ($requirement['mode'] ?? null))
+                || self::settlement($group) !== ApprovalDecision::APPROVE) {
+                return false;
+            }
+
+            $checked[$key] = true;
         }
+
+        return count($checked) === $byOwner->count();
     }
 
     public static function scope(GovernanceInvocation $row): Scope

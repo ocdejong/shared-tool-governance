@@ -11,6 +11,8 @@ use Ocdejong\SharedToolGovernance\Authorization\ScopeAccess;
 use Ocdejong\SharedToolGovernance\Contracts\ResourceAuthority;
 use Ocdejong\SharedToolGovernance\Contracts\TrustedInvocationContext;
 use Ocdejong\SharedToolGovernance\Data\VerifiedReply;
+use Ocdejong\SharedToolGovernance\Models\GovernanceApproval;
+use Ocdejong\SharedToolGovernance\Models\GovernanceInvocation;
 use Ocdejong\SharedToolGovernance\Models\GovernanceOutboxMessage;
 use Ocdejong\SharedToolGovernance\Outbox\ApprovalWork;
 
@@ -25,11 +27,16 @@ final readonly class Approvals
 
     public function decide(string $approvalId, ApprovalDecision $decision, VerifiedReply $reply): bool
     {
+        return $this->respond($approvalId, $decision, $reply)->accepted;
+    }
+
+    public function respond(string $approvalId, ApprovalDecision $decision, VerifiedReply $reply): ApprovalResponse
+    {
         if ($approvalId === '' || $reply->cardId === '' || $reply->replyId === '') {
-            return false;
+            return ApprovalResponse::refused();
         }
 
-        return DB::transaction(function () use ($approvalId, $decision, $reply): bool {
+        return DB::transaction(function () use ($approvalId, $decision, $reply): ApprovalResponse {
             $card = GovernanceOutboxMessage::query()
                 ->where('delivery_id', $approvalId)
                 ->where('card_id', $reply->cardId)
@@ -37,52 +44,69 @@ final readonly class Approvals
                 ->where('delivered_at', '!=', null)
                 ->first();
             if ($card === null) {
-                return false;
+                return ApprovalResponse::refused();
             }
 
             $row = ApprovalStore::locked((int) $card->getAttribute('invocation_row_id'));
             if ($row === null || ! $this->access->allows(
                 ApprovalStore::scope($row), $reply->scope, $reply->senderId,
                 $row->getAttribute('requester_id'), ...$row->getAttribute('audience'),
-            )) {
-                return false;
+            ) || ApprovalStore::hasCombinedLegacyCard($row)) {
+                return ApprovalResponse::refused();
             }
 
-            $approvals = ApprovalStore::approvals($row)->where('approver_id', $reply->senderId);
-            $original = (clone $approvals)->where('approval_id', $approvalId)->first();
-            if ($original === null) {
-                return false;
-            }
+            $original = ApprovalStore::approvals($row)->where('approval_id', $approvalId)
+                ->where('approver_id', $reply->senderId)->first();
 
-            $previous = $original->getAttribute('decision');
-            if ($previous !== null) {
-                return $previous === $decision->value && $original->getAttribute('reply_id') === $reply->replyId;
-            }
-
-            $now = now();
-            if ($row->getAttribute('status') !== 'pending_approval' || ApprovalStore::expiresAt($row) <= $now) {
-                return false;
-            }
-
-            $approvals->whereNull('decision')->update([
-                'decision' => $decision->value,
-                'reply_id' => $reply->replyId,
-                'decided_at' => $approvals->getModel()->fromDateTime($now),
-            ]);
-            InvocationStore::audit($row, 'approval_decided', ['approval_id' => $approvalId, 'decision' => $decision->value]);
-
-            $status = match (true) {
-                $decision === ApprovalDecision::DECLINE => 'declined',
-                ! ApprovalStore::approvals($row)->whereNull('decision')->exists() => 'approved',
-                default => null,
-            };
-            if ($status !== null) {
-                ApprovalStore::move($row, $status);
-                DB::afterCommit(static fn () => ApprovalWork::resume((int) $row->getKey()));
-            }
-
-            return true;
+            return $original === null
+                ? ApprovalResponse::refused()
+                : self::recordDecision($row, $original, $decision, $reply);
         }, 3);
+    }
+
+    private static function recordDecision(
+        GovernanceInvocation $row,
+        GovernanceApproval $card,
+        ApprovalDecision $decision,
+        VerifiedReply $reply,
+    ): ApprovalResponse {
+        $requirement = ApprovalStore::approvals($row)
+            ->where('owner_type', $card->getAttribute('owner_type')->value)
+            ->where('owner_id', $card->getAttribute('owner_id'))
+            ->get();
+        $recorded = $card->getAttribute('decision');
+        $duplicate = $recorded === $decision->value && $card->getAttribute('reply_id') === $reply->replyId;
+        $settled = ApprovalStore::settlement($requirement);
+        if ($settled !== null) {
+            return ApprovalResponse::settled($settled, $duplicate);
+        }
+        if ($duplicate) {
+            return ApprovalResponse::recorded();
+        }
+
+        if ($recorded !== null || $row->getAttribute('status') !== 'pending_approval' || ApprovalStore::expiresAt($row) <= now()
+            || ApprovalStore::approvals($row)->where('approver_id', $reply->senderId)->whereNotNull('decision')->exists()) {
+            return ApprovalResponse::refused();
+        }
+
+        $card->forceFill(['decision' => $decision->value, 'reply_id' => $reply->replyId, 'decided_at' => now()])->save();
+        InvocationStore::audit($row, 'approval_decided', ['approval_id' => $card->getAttribute('approval_id'), 'decision' => $decision->value]);
+
+        $status = match (true) {
+            $decision === ApprovalDecision::DECLINE => 'declined',
+            ApprovalStore::hasDistinctConsent($row) => 'approved',
+            default => null,
+        };
+        if ($status !== null) {
+            ApprovalStore::move($row, $status);
+            DB::afterCommit(static fn () => ApprovalWork::resume((int) $row->getKey()));
+        }
+
+        $settled = ApprovalStore::settlement($requirement->map(
+            static fn (GovernanceApproval $candidate): GovernanceApproval => $candidate->is($card) ? $card : $candidate,
+        ));
+
+        return $settled === null ? ApprovalResponse::recorded() : ApprovalResponse::settled($settled, true);
     }
 
     /** @return array{status: string, outcome?: string}|null Requester-only status, without provider data. */

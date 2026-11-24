@@ -28,7 +28,7 @@ final readonly class ApprovalDelivery
             }
 
             $row = ApprovalStore::locked((int) $message->getAttribute('invocation_row_id'));
-            if ($row === null || $row->getAttribute('status') !== 'pending_approval') {
+            if ($row === null || $row->getAttribute('status') !== 'pending_approval' || ApprovalStore::hasCombinedLegacyCard($row)) {
                 return;
             }
 
