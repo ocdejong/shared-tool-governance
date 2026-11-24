@@ -21,12 +21,16 @@ use Ocdejong\SharedToolGovernance\Tools\ToolRegistry;
  */
 final readonly class CallPolicy
 {
+    private ScopeAccess $access;
+
     public function __construct(
         private ToolRegistry $tools,
         private TrustedInvocationContext $context,
         private ResourceAuthority $authority,
         private RuleEvaluator $rules,
-    ) {}
+    ) {
+        $this->access = new ScopeAccess($authority);
+    }
 
     public function freeze(Invocation $proposal): FrozenCall
     {
@@ -74,19 +78,14 @@ final readonly class CallPolicy
 
         $context = $frozen->call->context;
         $scope = $context->scope;
-        foreach (array_unique([$context->requesterId, ...$context->audience], SORT_STRING) as $person) {
-            if (! $this->authority->isMember($scope, $person)) {
-                return null;
-            }
+        if (! $this->allowsParticipants($frozen)) {
+            return null;
         }
 
         $owners = [];
         foreach ($frozen->targets as $target) {
             $owner = $this->authority->ownerOf($scope, $target);
-            if ($owner === null || match ($owner->type) {
-                OwnerType::PERSON => ! $this->authority->isMember($scope, $owner->id),
-                OwnerType::HOUSEHOLD => $owner->id !== $scope->householdId,
-            }) {
+            if ($owner === null || ! $this->access->includesOwner($scope, $owner)) {
                 return null;
             }
 
@@ -127,7 +126,7 @@ final readonly class CallPolicy
             $approver = $this->authority->approverFor($scope, $frozen->targets[$index], $owner);
             if ($approver === null || $approver === ''
                 || ($owner->type === OwnerType::PERSON && $owner->id !== $approver)
-                || ! $this->authority->isMember($scope, $approver)) {
+                || ! $this->access->allows($scope, $scope, $approver)) {
                 return null;
             }
 
@@ -141,6 +140,14 @@ final readonly class CallPolicy
         }
 
         return $requirements;
+    }
+
+    /** @internal */
+    public function allowsParticipants(FrozenCall $frozen): bool
+    {
+        $context = $frozen->call->context;
+
+        return $this->access->allowsContext($context->scope, $context);
     }
 
     /** @return list<string> */

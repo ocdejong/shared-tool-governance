@@ -16,7 +16,7 @@ final class InvocationStore
     {
         return GovernanceInvocation::query()
             ->where('host_scope', $scope->hostScope)
-            ->where('household_id', $scope->householdId)
+            ->where('household_id', $scope->workspaceId)
             ->where('invocation_id', $id);
     }
 

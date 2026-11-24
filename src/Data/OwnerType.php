@@ -7,5 +7,8 @@ namespace Ocdejong\SharedToolGovernance\Data;
 enum OwnerType: string
 {
     case PERSON = 'person';
-    case HOUSEHOLD = 'household';
+    case WORKSPACE = 'household';
+
+    /** @deprecated Use WORKSPACE. */
+    public const self HOUSEHOLD = self::WORKSPACE;
 }

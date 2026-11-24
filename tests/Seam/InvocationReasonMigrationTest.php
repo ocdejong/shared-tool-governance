@@ -52,6 +52,9 @@ it('upgrades pre-change reasons, preserves pending approval and restores only re
     $host->bind();
     $policy = app(CallPolicy::class);
     $pending = $policy->freeze($host->call('pending'));
+    // Recorded by the pre-workspace authorizer at c72f153.
+    $baselineFingerprint = 'c0599d994eb15c8eeb34d9ca47e0c31bbacdb4583e1f73932646e56941846902';
+    expect($pending->fingerprint())->toBe($baselineFingerprint);
     $decisions = $policy->evaluate($pending) ?? throw new LogicException('Expected a rule decision.');
     $requirements = $policy->approvalRequirements($pending, $decisions) ?? throw new LogicException('Expected approval requirements.');
     $inputs = $pending->inputs() + ['decisions' => $decisions, 'approval_requirements' => $requirements];
@@ -80,7 +83,7 @@ it('upgrades pre-change reasons, preserves pending approval and restores only re
             'runtime_id' => 'runtime',
             'executor_id' => 'worker',
             'audience' => ['requester'],
-            'fingerprint' => $frozen->fingerprint(),
+            'fingerprint' => $id === 'pending' ? $baselineFingerprint : $frozen->fingerprint(),
         ]);
         if ($fields['status'] === 'pending_approval') {
             ApprovalStore::stage($row, $frozen, $requirements);

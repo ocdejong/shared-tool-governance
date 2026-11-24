@@ -8,6 +8,7 @@ use Carbon\CarbonInterface;
 use Illuminate\Support\Facades\DB;
 use Ocdejong\SharedToolGovernance\Approvals\ApprovalStore;
 use Ocdejong\SharedToolGovernance\Authorization\InvocationStore;
+use Ocdejong\SharedToolGovernance\Authorization\ScopeAccess;
 use Ocdejong\SharedToolGovernance\Contracts\ResourceAuthority;
 use Ocdejong\SharedToolGovernance\Contracts\TrustedInvocationContext;
 use Ocdejong\SharedToolGovernance\Data\InvocationContext;
@@ -27,12 +28,17 @@ final readonly class Activity
 {
     private const int RECENT_LIMIT = 50;
 
-    public function __construct(private ResourceAuthority $authority, private TrustedInvocationContext $context) {}
+    private ScopeAccess $access;
+
+    public function __construct(private ResourceAuthority $authority, private TrustedInvocationContext $context)
+    {
+        $this->access = new ScopeAccess($authority);
+    }
 
     public function revoke(string $invocationId): bool
     {
         $viewer = $this->context->current();
-        if (! $this->authority->isMember($viewer->scope, $viewer->requesterId)) {
+        if (! $this->access->allows($viewer->scope, $viewer->scope, $viewer->requesterId)) {
             return false;
         }
 
@@ -59,13 +65,13 @@ final readonly class Activity
     public function recentUse(?string $invocationId = null): array
     {
         $viewer = $this->context->current();
-        if (! $this->authority->isMember($viewer->scope, $viewer->requesterId)) {
+        if (! $this->access->allowsContext($viewer->scope, $viewer)) {
             return [];
         }
 
         $query = GovernanceInvocation::query()
             ->where('host_scope', $viewer->scope->hostScope)
-            ->where('household_id', $viewer->scope->householdId);
+            ->where('household_id', $viewer->scope->workspaceId);
         if ($invocationId !== null) {
             $query->where('invocation_id', $invocationId);
         }
@@ -208,7 +214,8 @@ final readonly class Activity
     {
         $resource = new ResourceReference($target['type'], $target['id'], $target['revision'], $target['accountAlias']);
         $owner = $this->authority->ownerOf($viewer->scope, $resource);
-        if ($owner === null || $owner->type->value !== $target['owner_type'] || $owner->id !== $target['owner_id']) {
+        if ($owner === null || $owner->type->value !== $target['owner_type'] || $owner->id !== $target['owner_id']
+            || ! $this->access->includesOwner($viewer->scope, $owner)) {
             return false;
         }
 

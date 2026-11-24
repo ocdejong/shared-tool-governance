@@ -256,7 +256,7 @@ final class TwoOwnerServiceProvider extends ServiceProvider implements Completio
     private static function completionPath(InvocationContext $context, string $invocationId): string
     {
         $key = json_encode([
-            $context->scope->hostScope, $context->scope->householdId, $context->requesterId, $context->runtimeId, $invocationId,
+            $context->scope->hostScope, $context->scope->workspaceId, $context->requesterId, $context->runtimeId, $invocationId,
         ], JSON_THROW_ON_ERROR);
 
         return 'completion-inbox/'.hash('sha256', $key).'.json';

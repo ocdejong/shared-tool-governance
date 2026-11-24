@@ -40,7 +40,7 @@ final class RulesHost implements ResourceAuthority, TrustedInvocationContext
 
         return match ($resource->id) {
             'tom', 'pauline', 'lee' => new OwnerReference(OwnerType::PERSON, $resource->id),
-            'shared' => new OwnerReference(OwnerType::HOUSEHOLD, 'home'),
+            'shared' => new OwnerReference(OwnerType::WORKSPACE, 'home'),
             default => null,
         };
     }
@@ -52,6 +52,6 @@ final class RulesHost implements ResourceAuthority, TrustedInvocationContext
 
     public function approverFor(Scope $scope, ResourceReference $resource, OwnerReference $owner): string
     {
-        return $owner->type === OwnerType::HOUSEHOLD ? 'tom' : $owner->id;
+        return $owner->type === OwnerType::WORKSPACE ? 'tom' : $owner->id;
     }
 }

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Ocdejong\SharedToolGovernance\Discovery;
 
 use Closure;
+use Ocdejong\SharedToolGovernance\Authorization\ScopeAccess;
 use Ocdejong\SharedToolGovernance\Contracts\ResourceAuthority;
 use Ocdejong\SharedToolGovernance\Contracts\RuleEvaluator;
 use Ocdejong\SharedToolGovernance\Contracts\TrustedInvocationContext;
@@ -18,6 +19,8 @@ use Ocdejong\SharedToolGovernance\Tools\ToolRegistry;
 
 final readonly class ToolDiscovery
 {
+    private ScopeAccess $access;
+
     /** @var ToolRegistry|list<ToolDefinition> */
     private ToolRegistry|array $registeredTools;
 
@@ -32,6 +35,7 @@ final readonly class ToolDiscovery
         iterable $registeredTools,
         private ?Closure $visibility = null,
     ) {
+        $this->access = new ScopeAccess($authority);
         $this->registeredTools = $registeredTools instanceof ToolRegistry
             ? $registeredTools
             : iterator_to_array($registeredTools, preserve_keys: false);
@@ -52,9 +56,7 @@ final readonly class ToolDiscovery
     public function discover(Scope $scope, array $owners, DiscoveryMode $mode = DiscoveryMode::ALL, ?string $namespace = null): DiscoveryResult
     {
         $context = $this->context->current();
-        if ($scope->hostScope !== $context->scope->hostScope
-            || $scope->householdId !== $context->scope->householdId
-            || ! $this->authority->isMember($scope, $context->requesterId)) {
+        if (! $this->access->allowsContext($scope, $context)) {
             throw new RuleAccessDenied('Discovery is unavailable in this scope.');
         }
 
@@ -95,11 +97,7 @@ final readonly class ToolDiscovery
 
     private function verifyTarget(Scope $scope, DiscoveryTarget $target): void
     {
-        $validOwner = match ($target->owner->type) {
-            OwnerType::PERSON => $this->authority->isMember($scope, $target->owner->id),
-            OwnerType::HOUSEHOLD => $target->owner->id === $scope->householdId,
-        };
-        if (! $validOwner) {
+        if (! $this->access->includesOwner($scope, $target->owner)) {
             throw new RuleAccessDenied('Discovery is unavailable for a selected owner or resource.');
         }
 

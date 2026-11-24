@@ -29,7 +29,7 @@ final readonly class Authorizer
 
         $existing = $query->first();
         if ($existing !== null) {
-            return self::existingResult($existing, $invocation->id, $fingerprint);
+            return $this->existingResult($existing, $frozen, $fingerprint);
         }
 
         try {
@@ -37,7 +37,7 @@ final readonly class Authorizer
         } catch (UniqueConstraintViolationException $exception) {
             $existing = $query->first() ?? throw $exception;
 
-            return self::existingResult($existing, $invocation->id, $fingerprint);
+            return $this->existingResult($existing, $frozen, $fingerprint);
         }
     }
 
@@ -57,7 +57,7 @@ final readonly class Authorizer
         $issuedAt = now();
         $row = GovernanceInvocation::query()->forceCreate([
             'host_scope' => $context->scope->hostScope,
-            'household_id' => $context->scope->householdId,
+            'household_id' => $context->scope->workspaceId,
             'invocation_id' => $call->id,
             'tool_name' => $call->toolName,
             'tool_version' => $call->toolVersion,
@@ -92,8 +92,13 @@ final readonly class Authorizer
         return new AuthorizationResult($status, $call->id, $token);
     }
 
-    private static function existingResult(GovernanceInvocation $row, string $id, string $fingerprint): AuthorizationResult
+    private function existingResult(GovernanceInvocation $row, FrozenCall $frozen, string $fingerprint): AuthorizationResult
     {
+        $id = $frozen->call->id;
+        if (! $this->policy->allowsParticipants($frozen)) {
+            return new AuthorizationResult('denied', $id);
+        }
+
         if ($row->getAttribute('fingerprint') !== $fingerprint) {
             throw new InvocationConflict('Invocation ID is already bound to a different call.');
         }

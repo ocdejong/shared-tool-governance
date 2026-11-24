@@ -7,6 +7,7 @@ use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Queue;
+use Ocdejong\SharedToolGovernance\Activity\Activity;
 use Ocdejong\SharedToolGovernance\Approvals\ApprovalDecision;
 use Ocdejong\SharedToolGovernance\Approvals\ApprovalPreview;
 use Ocdejong\SharedToolGovernance\Approvals\ApprovalResumption;
@@ -19,10 +20,15 @@ use Ocdejong\SharedToolGovernance\Contracts\RuleEvaluator;
 use Ocdejong\SharedToolGovernance\Contracts\ToolExecutor;
 use Ocdejong\SharedToolGovernance\Data\Invocation;
 use Ocdejong\SharedToolGovernance\Data\InvocationContext;
+use Ocdejong\SharedToolGovernance\Data\OwnerReference;
+use Ocdejong\SharedToolGovernance\Data\OwnerType;
 use Ocdejong\SharedToolGovernance\Data\ResourceReference;
 use Ocdejong\SharedToolGovernance\Data\Scope;
 use Ocdejong\SharedToolGovernance\Data\Verdict;
 use Ocdejong\SharedToolGovernance\Data\VerifiedReply;
+use Ocdejong\SharedToolGovernance\Discovery\DiscoveryAccess;
+use Ocdejong\SharedToolGovernance\Discovery\DiscoveryTarget;
+use Ocdejong\SharedToolGovernance\Discovery\ToolDiscovery;
 use Ocdejong\SharedToolGovernance\Jobs\DeliverApproval;
 use Ocdejong\SharedToolGovernance\Jobs\ResumeApproval;
 use Ocdejong\SharedToolGovernance\LocalInbox\LocalInbox;
@@ -34,7 +40,9 @@ use Ocdejong\SharedToolGovernance\Models\GovernanceOutboxMessage;
 use Ocdejong\SharedToolGovernance\Outbox\ApprovalDelivery;
 use Ocdejong\SharedToolGovernance\Outbox\ApprovalWork;
 use Ocdejong\SharedToolGovernance\Rules\ResourceRules;
+use Ocdejong\SharedToolGovernance\Rules\RuleAccessDenied;
 use Ocdejong\SharedToolGovernance\Tests\Approvals\ApprovalHost;
+use Ocdejong\SharedToolGovernance\Tools\ToolRegistry;
 
 beforeEach(function (): void {
     expect(Artisan::call('migrate'))->toBe(0, Artisan::output());
@@ -196,6 +204,71 @@ it('binds a decision to the verified scope, sender and original card', function 
     ApprovalHost::runResumeJobs();
     expect($host->executions)->toBe([])
         ->and(app(Approvals::class)->receipt('visit'))->toBe(['status' => 'declined']);
+});
+
+it('isolates rules, discovery, approvals and receipts for identical IDs in two workspaces', function (): void {
+    $host = new ApprovalHost;
+    $host->allHouseholdOwned = true;
+    $host->bind();
+    app()->instance(RuleEvaluator::class, app(ResourceRules::class));
+    $authorizer = app(Authorizer::class);
+    $approvals = app(Approvals::class);
+    $rules = app(ResourceRules::class);
+    $activity = app(Activity::class);
+    $first = new Scope(hostScope: 'tenant', workspaceId: 'team-a');
+    $second = new Scope(hostScope: 'tenant', workspaceId: 'team-b');
+    $resource = new ResourceReference('item', 'personal', 'r1');
+
+    $host->context = new InvocationContext($first, 'bob', 'runtime', ['bob']);
+    $rules->setRules($first, $resource, 0, ['rules' => ['items' => Verdict::DELEGATE]]);
+    $host->context = new InvocationContext($second, 'bob', 'runtime', ['bob']);
+    expect($rules->getRules($second, $resource)->revision)->toBe(0);
+    $rules->setRules($second, $resource, 0, ['rules' => ['items' => Verdict::DENY]]);
+
+    $discover = new ToolDiscovery($host, $host, $rules, app(ToolRegistry::class), static fn () => DiscoveryAccess::VISIBLE);
+    $target = new DiscoveryTarget(new OwnerReference(OwnerType::WORKSPACE, $second->workspaceId), $resource);
+    expect($discover->discover($second, [$target])->actions['items.reschedule'][0]->verdict)->toBe(Verdict::DENY)
+        ->and(fn () => $discover->discover($first, [$target]))->toThrow(RuleAccessDenied::class)
+        ->and(fn () => $discover->discover($first, []))->toThrow(RuleAccessDenied::class);
+
+    $host->context = new InvocationContext($first, 'requester', 'runtime', ['requester']);
+    expect($authorizer->authorize($host->call())->status)->toBe('pending_approval');
+    ApprovalHost::deliverCards();
+    $card = $host->inbox->cards($first, 'bob')[0];
+
+    $host->context = new InvocationContext($second, 'requester', 'runtime', ['requester']);
+    expect($approvals->receipt('visit'))->toBeNull()
+        ->and($activity->recentUse('visit'))->toBe([])
+        ->and($authorizer->authorize($host->call())->status)->toBe('denied')
+        ->and($approvals->decide($card->approvalId, ApprovalDecision::APPROVE, new VerifiedReply($second, 'bob', $card->cardId, 'reply')))->toBeFalse()
+        ->and($approvals->receipt('visit'))->toBe(['status' => 'denied'])
+        ->and($activity->recentUse('visit')[0]['status'])->toBe('denied');
+
+    $host->context = new InvocationContext($first, 'requester', 'runtime', ['requester']);
+    expect($host->decideFromInbox('bob'))->toBeTrue();
+    ApprovalHost::runResumeJobs();
+    expect($host->executions)->toHaveCount(1)
+        ->and($host->executions[0]->context->scope)->toEqual($first)
+        ->and($approvals->receipt('visit'))->toBe(['status' => 'granted', 'outcome' => 'success'])
+        ->and($activity->recentUse('visit')[0]['status'])->toBe('granted')
+        ->and(DB::table('governance_resource_bindings')->pluck('owner_type')->all())->toBe(['household', 'household'])
+        ->and(DB::table('governance_approvals')->value('owner_type'))->toBe('household');
+});
+
+it('refuses a reply and receipt when the relevant members leave the workspace', function (): void {
+    $host = new ApprovalHost;
+    $host->context = new InvocationContext($host->context->scope, 'requester', 'runtime', ['requester', 'bob']);
+    requestApproval($host);
+    $host->members = ['requester', 'alice'];
+    $discovery = new ToolDiscovery($host, $host, $host, [], static fn () => throw new LogicException('Check membership before visibility.'));
+
+    expect(fn () => $discovery->discover($host->context->scope, []))->toThrow(RuleAccessDenied::class)
+        ->and($host->decideFromInbox('alice'))->toBeFalse()
+        ->and(app(Approvals::class)->receipt('visit'))->toBeNull()
+        ->and(app(Activity::class)->recentUse('visit'))->toBe([])
+        ->and(app(Authorizer::class)->authorize($host->call())->status)->toBe('denied')
+        ->and(GovernanceApproval::query()->firstOrFail()->getAttribute('decision'))->toBeNull();
+    Queue::assertNotPushed(ResumeApproval::class);
 });
 
 it('expires both unanswered cards and fully approved calls awaiting a worker', function (bool $approve): void {

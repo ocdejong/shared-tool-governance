@@ -174,9 +174,9 @@ final class ApprovalHost implements ResourceAuthority, ResumptionContext, RuleEv
     {
         return match ($resource->id) {
             'personal' => $this->allHouseholdOwned
-                ? new OwnerReference(OwnerType::HOUSEHOLD, $scope->householdId)
+                ? new OwnerReference(OwnerType::WORKSPACE, $scope->workspaceId)
                 : new OwnerReference(OwnerType::PERSON, $this->personalOwner),
-            'shared' => new OwnerReference(OwnerType::HOUSEHOLD, $scope->householdId),
+            'shared' => new OwnerReference(OwnerType::WORKSPACE, $scope->workspaceId),
             default => null,
         };
     }

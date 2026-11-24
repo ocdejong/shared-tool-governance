@@ -7,6 +7,7 @@ namespace Ocdejong\SharedToolGovernance\Approvals;
 use Illuminate\Support\Facades\DB;
 use Ocdejong\SharedToolGovernance\Activity\ActivityState;
 use Ocdejong\SharedToolGovernance\Authorization\InvocationStore;
+use Ocdejong\SharedToolGovernance\Authorization\ScopeAccess;
 use Ocdejong\SharedToolGovernance\Contracts\ResourceAuthority;
 use Ocdejong\SharedToolGovernance\Contracts\TrustedInvocationContext;
 use Ocdejong\SharedToolGovernance\Data\VerifiedReply;
@@ -15,7 +16,12 @@ use Ocdejong\SharedToolGovernance\Outbox\ApprovalWork;
 
 final readonly class Approvals
 {
-    public function __construct(private ResourceAuthority $authority, private TrustedInvocationContext $context) {}
+    private ScopeAccess $access;
+
+    public function __construct(ResourceAuthority $authority, private TrustedInvocationContext $context)
+    {
+        $this->access = new ScopeAccess($authority);
+    }
 
     public function decide(string $approvalId, ApprovalDecision $decision, VerifiedReply $reply): bool
     {
@@ -35,8 +41,10 @@ final readonly class Approvals
             }
 
             $row = ApprovalStore::locked((int) $card->getAttribute('invocation_row_id'));
-            if ($row === null || ! ApprovalStore::scope($row)->equals($reply->scope)
-                || ! $this->authority->isMember($reply->scope, $reply->senderId)) {
+            if ($row === null || ! $this->access->allows(
+                ApprovalStore::scope($row), $reply->scope, $reply->senderId,
+                $row->getAttribute('requester_id'), ...$row->getAttribute('audience'),
+            )) {
                 return false;
             }
 
@@ -81,7 +89,7 @@ final readonly class Approvals
     public function receipt(string $invocationId): ?array
     {
         $context = $this->context->current();
-        if (! $this->authority->isMember($context->scope, $context->requesterId)) {
+        if (! $this->access->allowsContext($context->scope, $context)) {
             return null;
         }
 

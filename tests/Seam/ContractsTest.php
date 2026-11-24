@@ -55,3 +55,19 @@ it('lets authorization receive the effective verdict and deciding revision throu
         ->and($result->matchedActionKey)->toBe('calendar')
         ->and($result->revision)->toBe(3);
 });
+
+it('accepts both workspace and legacy scope names and restores scopes from queued jobs', function (): void {
+    $scope = new Scope(hostScope: 'tenant', workspaceId: 'home');
+    $legacy = new Scope(hostScope: 'tenant', householdId: 'home');
+    $baseline = 'O:40:"Ocdejong\SharedToolGovernance\Data\Scope":2:{s:9:"hostScope";s:6:"tenant";s:11:"householdId";s:4:"home";}';
+    $restored = unserialize($baseline, ['allowed_classes' => [Scope::class]]);
+    expect($restored)->toBeInstanceOf(Scope::class);
+
+    expect($scope->equals($legacy))->toBeTrue()
+        ->and($scope->householdId)->toBe('home')
+        ->and(serialize($scope))->toBe($baseline)
+        ->and($restored->workspaceId)->toBe('home')
+        ->and(OwnerType::from('household'))->toBe(OwnerType::WORKSPACE)
+        ->and(OwnerType::HOUSEHOLD)->toBe(OwnerType::WORKSPACE)
+        ->and(fn () => new Scope('tenant', 'home', householdId: 'other'))->toThrow(InvalidArgumentException::class);
+});
