@@ -7,8 +7,8 @@ namespace Ocdejong\SharedToolGovernance\Data;
 enum OwnerType: string
 {
     case PERSON = 'person';
-    case WORKSPACE = 'household';
+    case HOUSEHOLD = 'household';
 
-    /** @deprecated Use WORKSPACE. */
-    public const self HOUSEHOLD = self::WORKSPACE;
+    // PHP serializes the case name, so keep HOUSEHOLD for rolling deploys.
+    public const self WORKSPACE = self::HOUSEHOLD;
 }
