@@ -146,8 +146,12 @@ it('prunes terminal inputs at thirty days and preserves accurately filtered rece
     DB::enableQueryLog();
     expect($activity->revoke('revoked'))->toBeTrue()
         ->and(fn () => $grants->redeem($revoked, $host->call('revoked')))->toThrow(RedemptionRefused::class);
-    $grants->redeem($unknownGrant, $unknownCall);
-    expect($activity->revoke('unknown'))->toBeFalse();
+    $host->timeout = true;
+    expect($grants->redeem($unknownGrant, $unknownCall)->status)->toBe(ExecutionStatus::UNKNOWN)
+        ->and(array_column($host->executions, 'id'))->toBe(['unknown'])
+        ->and($activity->recentUse('unknown'))->toBe([['status' => 'granted', 'outcome' => 'unknown']])
+        ->and($activity->revoke('unknown'))->toBeFalse();
+    $host->timeout = false;
     DB::disableQueryLog();
     $grants->recordOutcome('unknown', ExecutionStatus::UNKNOWN, 'private provider reference');
 
@@ -166,7 +170,7 @@ it('prunes terminal inputs at thirty days and preserves accurately filtered rece
 
     expect(DB::table('governance_invocations')->where('invocation_id', 'waiting')->value('frozen_inputs'))
         ->toBeString()
-        ->not->toContain('hidden detail')
+        ->not->toContain('private argument marker')
         ->not->toContain('10:00');
 
     activityViewer($host, 'alice');
@@ -243,7 +247,8 @@ it('prunes terminal inputs at thirty days and preserves accurately filtered rece
             'unused grant token' => $unused,
             'revoked grant token' => $revoked,
             'redeemed grant token' => $unknownGrant,
-            'raw argument value' => 'hidden detail',
+            'raw argument value' => 'private argument marker',
+            'raw reason' => 'private reason marker',
             'raw argument name' => 'scheduled_time',
             'private preview' => 'Move the repair visit',
             'provider reference' => 'private provider reference',
