@@ -32,10 +32,18 @@
             ]
         }
     },
+    "scripts": {
+        "test": [
+            "@php vendor/bin/pest",
+            "@php vendor/bin/pint --test src database/migrations tests",
+            "@php vendor/bin/phpstan analyse --no-progress"
+        ]
+    },
     "config": {
         "allow-plugins": {
             "pestphp/pest-plugin": true
         },
+        "process-timeout": 0,
         "sort-packages": true
     }
 }
