@@ -335,7 +335,11 @@ function runSmoke(array $argv): void
     foreach (['src', 'config', 'database'] as $directory) {
         check(is_dir($installed.'/'.$directory), "Missing package directory $directory.");
     }
-    foreach (['.git', '.gitattributes', '.github', '.gitignore', 'AGENTS.md', 'bin', 'phpstan.neon.dist', 'phpunit.xml.dist', 'pint.json', 'tests'] as $excluded) {
+    $developmentFiles = [
+        '.git', '.gitattributes', '.github', '.gitignore', '.phpunit.cache', 'AGENTS.md', 'bin',
+        'composer.lock', 'phpstan.neon.dist', 'phpunit.xml.dist', 'pint.json', 'tests', 'vendor',
+    ];
+    foreach ($developmentFiles as $excluded) {
         check(! file_exists($installed.'/'.$excluded), "Unexpected package entry $excluded.");
     }
 

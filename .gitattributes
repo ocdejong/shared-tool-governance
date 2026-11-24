@@ -1,9 +1,13 @@
+/.git export-ignore
 /.gitattributes export-ignore
 /.github export-ignore
 /.gitignore export-ignore
+/.phpunit.cache export-ignore
 /AGENTS.md export-ignore
 /bin export-ignore
+/composer.lock export-ignore
 /phpstan.neon.dist export-ignore
 /phpunit.xml.dist export-ignore
 /pint.json export-ignore
 /tests export-ignore
+/vendor export-ignore
