@@ -6,10 +6,12 @@ namespace App\Providers;
 
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\ServiceProvider;
 use InvalidArgumentException;
 use Ocdejong\SharedToolGovernance\Approvals\ApprovalPreview;
 use Ocdejong\SharedToolGovernance\Contracts\ApprovalNotifier;
+use Ocdejong\SharedToolGovernance\Contracts\CompletionHandler;
 use Ocdejong\SharedToolGovernance\Contracts\ResourceAuthority;
 use Ocdejong\SharedToolGovernance\Contracts\ResumptionContext;
 use Ocdejong\SharedToolGovernance\Contracts\RuleEvaluator;
@@ -31,8 +33,9 @@ use Ocdejong\SharedToolGovernance\Discovery\ToolDiscovery;
 use Ocdejong\SharedToolGovernance\LocalInbox\LocalInbox;
 use Ocdejong\SharedToolGovernance\Rules\ResourceRules;
 use Ocdejong\SharedToolGovernance\Tools\ToolRegistry;
+use RuntimeException;
 
-final class TwoOwnerServiceProvider extends ServiceProvider implements ResourceAuthority, ResumptionContext, ToolExecutor, TrustedInvocationContext
+final class TwoOwnerServiceProvider extends ServiceProvider implements CompletionHandler, ResourceAuthority, ResumptionContext, ToolExecutor, TrustedInvocationContext
 {
     public const CALL_ID = 'planning-call';
 
@@ -46,7 +49,7 @@ final class TwoOwnerServiceProvider extends ServiceProvider implements ResourceA
 
     public function register(): void
     {
-        foreach ([self::class, ResourceAuthority::class, ResumptionContext::class, TrustedInvocationContext::class] as $contract) {
+        foreach ([self::class, CompletionHandler::class, ResourceAuthority::class, ResumptionContext::class, TrustedInvocationContext::class] as $contract) {
             $this->app->instance($contract, $this);
         }
         $this->app->singleton(LocalInbox::class);
@@ -100,7 +103,8 @@ final class TwoOwnerServiceProvider extends ServiceProvider implements ResourceA
     public function forInvocation(Scope $scope, string $invocationId): ?InvocationContext
     {
         $request = Cache::store('database')->get('demo.request-context');
-        if (! is_array($request) || $request['id'] !== $invocationId || ! $this->isMember($scope, $request['requester'])) {
+        if (! is_array($request) || $request['id'] !== $invocationId
+            || ! $this->isMember($scope, $request['requester']) || $request['audience'] !== self::MEMBERS) {
             return null;
         }
 
@@ -208,10 +212,47 @@ final class TwoOwnerServiceProvider extends ServiceProvider implements ResourceA
             return new ExecutionResult(ExecutionStatus::FAILED);
         }
 
-        $result = ['suggestions' => $suggestions];
-        $cache->put('demo.model-result', $result);
+        return new ExecutionResult(ExecutionStatus::SUCCEEDED, ['suggestions' => $suggestions]);
+    }
 
-        return new ExecutionResult(ExecutionStatus::SUCCEEDED, $result);
+    public function completed(Scope $scope, string $invocationId, ExecutionResult $result): void
+    {
+        $context = $this->forInvocation($scope, $invocationId);
+        if ($context === null) {
+            return;
+        }
+
+        $written = Storage::disk('local')->put(self::completionPath($context, $invocationId), json_encode([
+            'status' => $result->status->value,
+            'result' => $result->result,
+        ], JSON_THROW_ON_ERROR), 'private');
+        if (! $written) {
+            throw new RuntimeException('The local completion inbox is unavailable.');
+        }
+    }
+
+    /** @return array<string, mixed>|null */
+    public function completion(string $invocationId): ?array
+    {
+        $viewer = $this->current();
+        $context = $this->forInvocation($viewer->scope, $invocationId);
+        if ($context === null || $context->requesterId !== $viewer->requesterId || $context->runtimeId !== $viewer->runtimeId) {
+            return null;
+        }
+
+        $entry = Storage::disk('local')->get(self::completionPath($context, $invocationId));
+        $data = $entry === null ? null : json_decode($entry, true, flags: JSON_THROW_ON_ERROR);
+
+        return is_array($data) ? $data : null;
+    }
+
+    private static function completionPath(InvocationContext $context, string $invocationId): string
+    {
+        $key = json_encode([
+            $context->scope->hostScope, $context->scope->householdId, $context->requesterId, $context->runtimeId, $invocationId,
+        ], JSON_THROW_ON_ERROR);
+
+        return 'completion-inbox/'.hash('sha256', $key).'.json';
     }
 
     /** @return list<string> */

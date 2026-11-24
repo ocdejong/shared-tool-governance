@@ -180,6 +180,7 @@ if "$demo"; then
     '
     in_consumer php "$example/demo.php" prepare
     artisan queue:work --once --queue=default --tries=1
+    artisan queue:work --once --queue=default --tries=1
     in_consumer php "$example/demo.php" verify
 fi
 artisan migrate:rollback --force

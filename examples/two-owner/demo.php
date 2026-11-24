@@ -11,6 +11,7 @@ use Illuminate\Support\Facades\Http;
 use Ocdejong\SharedToolGovernance\Activity\Activity;
 use Ocdejong\SharedToolGovernance\Approvals\ApprovalDecision;
 use Ocdejong\SharedToolGovernance\Approvals\Approvals;
+use Ocdejong\SharedToolGovernance\Data\ExecutionStatus;
 use Ocdejong\SharedToolGovernance\Data\Verdict;
 use Ocdejong\SharedToolGovernance\Data\VerifiedReply;
 use Ocdejong\SharedToolGovernance\Discovery\DiscoveryMode;
@@ -52,9 +53,17 @@ function runDemo(string $phase): void
         check(DB::table('governance_grants')->count() === 1
             && DB::table('governance_grants')->whereNotNull('redeemed_at')->count() === 1, 'Expected one redeemed grant.');
 
-        $suggestions = $cache->get('demo.model-result');
-        check($suggestions === ['suggestions' => ['10:00–10:30']], 'Expected only the shared suggestion in the model result.');
-        show('Model result', $suggestions);
+        $completion = $host->completion($callId);
+        if ($completion !== [
+            'status' => ExecutionStatus::SUCCEEDED->value,
+            'result' => ['suggestions' => ['10:00–10:30']],
+        ]) {
+            throw new RuntimeException('Expected one private inbox result with only the shared suggestion.');
+        }
+        show('Private completion for Tom', $completion);
+
+        $host->viewAs('Pauline');
+        check($host->completion($callId) === null, 'Pauline must not see the result in the requester inbox.');
 
         $activity = app(Activity::class);
         foreach (['Tom', 'Pauline'] as $viewer) {
@@ -119,6 +128,7 @@ function runDemo(string $phase): void
         'id' => $callId,
         'requester' => $context->requesterId,
         'runtime' => $context->runtimeId,
+        'audience' => $context->audience,
     ]);
     $result = app(Governance::class)->call($callId, $definition->name, $definition->version, $arguments, REASON);
     check($result === ['status' => 'pending_approval', 'call_id' => $callId, 'result' => null],
