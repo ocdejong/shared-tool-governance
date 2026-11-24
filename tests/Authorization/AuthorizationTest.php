@@ -5,7 +5,10 @@ declare(strict_types=1);
 use Illuminate\Contracts\Container\BindingResolutionException;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
+use Ocdejong\SharedToolGovernance\Activity\Activity;
+use Ocdejong\SharedToolGovernance\Approvals\Approvals;
 use Ocdejong\SharedToolGovernance\Authorization\InvocationConflict;
+use Ocdejong\SharedToolGovernance\Contracts\ResourceAuthority;
 use Ocdejong\SharedToolGovernance\Contracts\ToolExecutor;
 use Ocdejong\SharedToolGovernance\Data\ExecutionStatus;
 use Ocdejong\SharedToolGovernance\Data\InvocationContext;
@@ -78,6 +81,39 @@ it('returns the saved state on identical retries and rejects changed contents', 
     ] as $call) {
         expect(fn () => $fixture->authorizer->authorize($call))->toThrow(InvocationConflict::class);
     }
+});
+
+it('uses the grant clock in every status reader and revocation', function (): void {
+    $fixture = new Fixture;
+    app()->instance(ResourceAuthority::class, $fixture);
+    $call = $fixture->call();
+    $token = $fixture->authorizer->authorize($call)->grantToken() ?? throw new LogicException('Expected a token.');
+    $activity = app(Activity::class);
+    $approvals = app(Approvals::class);
+
+    $this->travel(1)->day();
+    expect($approvals->receipt($call->id))->toBe(['status' => 'granted'])
+        ->and($activity->recentUse($call->id)[0]['status'])->toBe('granted')
+        ->and($fixture->authorizer->authorize($call)->status)->toBe('granted');
+
+    $otherCall = $fixture->call(id: 'revoke');
+    $otherToken = $fixture->authorizer->authorize($otherCall)->grantToken() ?? throw new LogicException('Expected a token.');
+    expect($activity->revoke($otherCall->id))->toBeTrue()
+        ->and(fn () => $fixture->grants->redeem($otherToken, $otherCall))->toThrow(RedemptionRefused::class);
+
+    $past = DB::connection()->getDriverName() === 'pgsql'
+        ? "clock_timestamp() - interval '1 second'"
+        : "datetime('now', '-1 second')";
+    DB::table('governance_grants')->whereNull('revoked_at')->update(['expires_at' => DB::raw($past)]);
+
+    $this->travelBack();
+    $this->travel(-1)->day();
+    expect($approvals->receipt($call->id))->toBe(['status' => 'approved_unused'])
+        ->and($activity->recentUse($call->id)[0]['status'])->toBe('approved_unused')
+        ->and($fixture->authorizer->authorize($call)->jsonSerialize())->toBe(['status' => 'approved_unused'])
+        ->and($activity->revoke($call->id))->toBeFalse()
+        ->and(fn () => $fixture->grants->redeem($token, $call))->toThrow(RedemptionRefused::class)
+        ->and($fixture->executions)->toBe([]);
 });
 
 it('keeps the opaque token out of serialization, database bindings, and audit data', function (): void {
@@ -313,13 +349,22 @@ it('refuses a token that does not belong to the exact scoped invocation', functi
     expect($fixture->grants->redeem($ownToken, $call)->status)->toBe(ExecutionStatus::SUCCEEDED);
 })->with(['wrong token', 'another invocation', 'another household']);
 
-it('uses the database clock for grant issuance and redemption in a non-UTC PostgreSQL session', function (): void {
+it('uses the database clock for grant issuance, redemption and revocation in non-UTC PostgreSQL sessions', function (string $appZone, string $sessionZone): void {
     if (DB::connection()->getDriverName() !== 'pgsql') {
         $this->markTestSkipped('Requires the dedicated PostgreSQL test database.');
     }
 
-    DB::statement("SET TIME ZONE 'America/New_York'");
+    $originalZone = date_default_timezone_get();
+    config(['app.timezone' => $appZone]);
+    date_default_timezone_set($appZone);
+    DB::selectOne("select set_config('TimeZone', ?, false)", [$sessionZone]);
+    $this->beforeApplicationDestroyed(static function () use ($originalZone): void {
+        date_default_timezone_set($originalZone);
+        DB::statement('reset time zone');
+    });
+
     $fixture = new Fixture;
+    app()->instance(ResourceAuthority::class, $fixture);
     $call = $fixture->call();
     $this->travel(1)->days();
     $token = $fixture->authorizer->authorize($call)->grantToken() ?? throw new LogicException('Expected a token.');
@@ -332,17 +377,19 @@ it('uses the database clock for grant issuance and redemption in a non-UTC Postg
         ->and((int) DB::table('governance_grants')
             ->selectRaw('abs(extract(epoch from clock_timestamp() - redeemed_at)) as age')->value('age'))->toBeLessThan(5);
 
-    $this->travelBack();
-    $this->travel(-1)->days();
-    $expiredCall = $fixture->call(id: 'expired-call');
-    $expiredToken = $fixture->authorizer->authorize($expiredCall)->grantToken() ?? throw new LogicException('Expected a token.');
-    $expiredRow = GovernanceInvocation::query()->where('invocation_id', 'expired-call')->sole();
-    DB::table('governance_grants')->where('invocation_row_id', $expiredRow->getKey())
-        ->update(['expires_at' => DB::raw("clock_timestamp() - interval '1 second'")]);
-
-    expect(fn () => $fixture->grants->redeem($expiredToken, $expiredCall))->toThrow(RedemptionRefused::class)
-        ->and($fixture->executions)->toHaveCount(1);
-});
+    $revokedCall = $fixture->call(id: 'revoked-call');
+    $fixture->authorizer->authorize($revokedCall);
+    expect(app(Activity::class)->revoke($revokedCall->id))->toBeTrue()
+        ->and((float) DB::table('governance_grants')
+            ->selectRaw('abs(extract(epoch from clock_timestamp() - revoked_at)) as age')
+            ->whereNotNull('revoked_at')->value('age'))->toBeLessThan(5);
+})->with(getenv('DB_DATABASE') === false ? [
+    ['America/New_York', 'America/New_York'],
+] : [
+    'New York app and session' => ['America/New_York', 'America/New_York'],
+    'Tokyo app and session' => ['Asia/Tokyo', 'Asia/Tokyo'],
+    'UTC app and New York session' => ['UTC', 'America/New_York'],
+]);
 
 it('refuses a grant that expires between locking and consuming it', function (): void {
     $fixture = new Fixture;

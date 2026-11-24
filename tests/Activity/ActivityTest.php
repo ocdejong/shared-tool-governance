@@ -253,6 +253,12 @@ it('prunes terminal inputs at thirty days and preserves accurately filtered rece
     $host->context = $requester;
     $authorize->authorize($call('denied'));
     expect($activity->recentUse('unused'))->toBe([['status' => 'granted', 'requester_id' => 'requester', 'approvals' => [], 'reason' => $reason]]);
+    $past = DB::connection()->getDriverName() === 'pgsql'
+        ? "clock_timestamp() - interval '1 second'"
+        : "datetime('now', '-1 second')";
+    $unusedRow = GovernanceInvocation::query()->where('invocation_id', 'unused')->sole();
+    DB::table('governance_grants')->where('invocation_row_id', $unusedRow->getKey())
+        ->update(['expires_at' => DB::raw($past)]);
 
     $receipts = [];
     foreach (['alice', 'bob'] as $viewer) {

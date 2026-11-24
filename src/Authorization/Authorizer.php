@@ -6,6 +6,7 @@ namespace Ocdejong\SharedToolGovernance\Authorization;
 
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\DB;
+use Ocdejong\SharedToolGovernance\Activity\ActivityState;
 use Ocdejong\SharedToolGovernance\Approvals\ApprovalStore;
 use Ocdejong\SharedToolGovernance\Data\Invocation;
 use Ocdejong\SharedToolGovernance\Data\Verdict;
@@ -86,6 +87,6 @@ final readonly class Authorizer
             throw new InvocationConflict('Invocation ID is already bound to a different call.');
         }
 
-        return new AuthorizationResult($row->getAttribute('status'), $id);
+        return new AuthorizationResult(ActivityState::read($row, now())->status, $id);
     }
 }

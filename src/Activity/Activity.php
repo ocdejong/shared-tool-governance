@@ -14,6 +14,7 @@ use Ocdejong\SharedToolGovernance\Data\InvocationContext;
 use Ocdejong\SharedToolGovernance\Data\OwnerType;
 use Ocdejong\SharedToolGovernance\Data\ResourceReference;
 use Ocdejong\SharedToolGovernance\Data\Verdict;
+use Ocdejong\SharedToolGovernance\Grants\GrantClock;
 use Ocdejong\SharedToolGovernance\Models\GovernanceInvocation;
 
 /**
@@ -106,9 +107,9 @@ final readonly class Activity
             return false;
         }
 
-        $now = now();
+        $now = GrantClock::sql();
 
-        return $query->where('expires_at', '>', $now)->update(['revoked_at' => $now]) === 1;
+        return $query->whereRaw(DB::raw('expires_at > '.$now))->update(['revoked_at' => DB::raw($now)]) === 1;
     }
 
     private function isRequester(GovernanceInvocation $row, InvocationContext $viewer): bool

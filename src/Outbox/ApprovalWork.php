@@ -10,6 +10,7 @@ use Ocdejong\SharedToolGovernance\Approvals\ApprovalStore;
 use Ocdejong\SharedToolGovernance\Grants\GrantClock;
 use Ocdejong\SharedToolGovernance\Jobs\DeliverApproval;
 use Ocdejong\SharedToolGovernance\Jobs\ResumeApproval;
+use Ocdejong\SharedToolGovernance\Models\GovernanceInvocation;
 use Ocdejong\SharedToolGovernance\Models\GovernanceOutboxMessage;
 
 final class ApprovalWork
@@ -29,7 +30,7 @@ final class ApprovalWork
     /** Requeue committed work after lost wakeups, missed deliveries or worker restarts. */
     public function recover(): void
     {
-        $cutoff = now()->subMinutes(ApprovalStore::LIFETIME_MINUTES);
+        $cutoff = (new GovernanceInvocation)->fromDateTime(now()->subMinutes(ApprovalStore::LIFETIME_MINUTES));
 
         DB::table('governance_invocations')->useWritePdo()
             ->where(function ($query) use ($cutoff): void {

@@ -9,6 +9,8 @@ use Ocdejong\SharedToolGovernance\Data\ExecutionStatus;
 
 final class GovernanceInvocation extends Model
 {
+    use WritesTimestampOffsets;
+
     protected $hidden = ['reason', 'frozen_inputs', 'receipt_targets', 'fingerprint', 'provider_reference'];
 
     protected function casts(): array

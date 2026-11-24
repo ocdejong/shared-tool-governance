@@ -145,7 +145,7 @@ final readonly class ApprovalResumption
     private function markUnused(GovernanceInvocation $row): void
     {
         $unused = GovernanceGrant::query()->where('invocation_row_id', $row->getKey())->where('redeemed_at', null);
-        if ($unused->update(['revoked_at' => now()]) === 1) {
+        if ($unused->update(['revoked_at' => DB::raw(GrantClock::sql())]) === 1) {
             ApprovalStore::move($row, 'approved_unused');
         }
     }

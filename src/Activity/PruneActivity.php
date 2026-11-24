@@ -19,8 +19,8 @@ final class PruneActivity
     {
         $now = now();
         $cutoff = $now->copy()->subDays(self::RETENTION_DAYS);
-        $candidates = GovernanceInvocation::query()
-            ->where('created_at', '<=', $cutoff);
+        $candidates = GovernanceInvocation::query();
+        $candidates->where('created_at', '<=', $candidates->getModel()->fromDateTime($cutoff));
         $candidates->getQuery()->whereNotNull('frozen_inputs')->useWritePdo();
 
         $count = 0;

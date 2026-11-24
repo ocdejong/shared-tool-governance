@@ -9,6 +9,8 @@ use Ocdejong\SharedToolGovernance\Data\OwnerType;
 
 final class GovernanceApproval extends Model
 {
+    use WritesTimestampOffsets;
+
     protected $hidden = ['preview'];
 
     protected function casts(): array

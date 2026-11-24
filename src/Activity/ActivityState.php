@@ -6,8 +6,11 @@ namespace Ocdejong\SharedToolGovernance\Activity;
 
 use Carbon\CarbonInterface;
 use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Support\Facades\Date;
+use Illuminate\Support\Facades\DB;
 use Ocdejong\SharedToolGovernance\Approvals\ApprovalStore;
 use Ocdejong\SharedToolGovernance\Data\ExecutionStatus;
+use Ocdejong\SharedToolGovernance\Grants\GrantClock;
 use Ocdejong\SharedToolGovernance\Models\GovernanceGrant;
 use Ocdejong\SharedToolGovernance\Models\GovernanceInvocation;
 
@@ -45,7 +48,15 @@ final readonly class ActivityState
             return new self($status, null, $terminalAt);
         }
 
-        $grant = self::grant($row)->first();
+        $query = self::grant($row);
+        $query->getQuery()->select(['expires_at', 'revoked_at', 'redeemed_at'])
+            ->addSelect(DB::raw('case when expires_at <= '.GrantClock::sql().' then 1 else 0 end as has_expired'));
+        $driver = $row->getConnection()->getDriverName();
+        if (in_array($driver, ['mysql', 'mariadb'], true)) {
+            $query->getQuery()->selectRaw('UNIX_TIMESTAMP(expires_at) as expiry_epoch');
+        }
+
+        $grant = $query->first();
         if ($grant?->getAttribute('redeemed_at') !== null) {
             $outcome = $row->getAttribute('outcome') ?? ExecutionStatus::UNKNOWN;
 
@@ -57,10 +68,16 @@ final readonly class ActivityState
             return new self('revoked', null, $revoked);
         }
 
-        $expires = $grant?->getAttribute('expires_at');
+        if ($grant === null || ! $grant->getAttribute('has_expired')) {
+            return new self($status, null, null);
+        }
 
-        return $expires !== null && $expires <= $now
-            ? new self('approved_unused', null, $expires)
-            : new self($status, null, null);
+        $expires = match ($driver) {
+            'sqlite' => Date::parse($grant->getRawOriginal('expires_at'), 'UTC'),
+            'mysql', 'mariadb' => Date::createFromTimestamp($grant->getAttribute('expiry_epoch')),
+            default => $grant->getAttribute('expires_at'),
+        };
+
+        return new self('approved_unused', null, $expires);
     }
 }

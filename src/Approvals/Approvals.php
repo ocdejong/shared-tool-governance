@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Ocdejong\SharedToolGovernance\Approvals;
 
 use Illuminate\Support\Facades\DB;
+use Ocdejong\SharedToolGovernance\Activity\ActivityState;
 use Ocdejong\SharedToolGovernance\Authorization\InvocationStore;
 use Ocdejong\SharedToolGovernance\Contracts\ResourceAuthority;
 use Ocdejong\SharedToolGovernance\Contracts\TrustedInvocationContext;
@@ -50,14 +51,15 @@ final readonly class Approvals
                 return $previous === $decision->value && $original->getAttribute('reply_id') === $reply->replyId;
             }
 
-            if ($row->getAttribute('status') !== 'pending_approval' || ApprovalStore::expiresAt($row) <= now()) {
+            $now = now();
+            if ($row->getAttribute('status') !== 'pending_approval' || ApprovalStore::expiresAt($row) <= $now) {
                 return false;
             }
 
             $approvals->whereNull('decision')->update([
                 'decision' => $decision->value,
                 'reply_id' => $reply->replyId,
-                'decided_at' => now(),
+                'decided_at' => $approvals->getModel()->fromDateTime($now),
             ]);
             InvocationStore::audit($row, 'approval_decided', ['approval_id' => $approvalId, 'decision' => $decision->value]);
 
@@ -92,9 +94,9 @@ final readonly class Approvals
             return null;
         }
 
-        $receipt = ['status' => $row->getAttribute('status')];
-        $outcome = $row->getAttribute('outcome');
+        $state = ActivityState::read($row, now());
+        $receipt = ['status' => $state->status];
 
-        return $outcome === null ? $receipt : $receipt + ['outcome' => $outcome->value];
+        return $state->outcome === null ? $receipt : $receipt + ['outcome' => $state->outcome->value];
     }
 }

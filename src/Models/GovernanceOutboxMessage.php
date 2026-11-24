@@ -8,6 +8,8 @@ use Illuminate\Database\Eloquent\Model;
 
 final class GovernanceOutboxMessage extends Model
 {
+    use WritesTimestampOffsets;
+
     protected $hidden = ['payload'];
 
     protected function casts(): array

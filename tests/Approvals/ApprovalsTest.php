@@ -48,6 +48,69 @@ function requestApproval(ApprovalHost $host, bool $two = false): void
     ApprovalHost::deliverCards();
 }
 
+it('uses the application clock for approvals across time zones', function (string $appZone, ?string $sessionZone): void {
+    $originalZone = date_default_timezone_get();
+    config(['app.timezone' => $appZone]);
+    date_default_timezone_set($appZone);
+    $this->beforeApplicationDestroyed(static function () use ($originalZone): void {
+        date_default_timezone_set($originalZone);
+    });
+    if ($sessionZone !== null) {
+        DB::selectOne("select set_config('TimeZone', ?, false)", [$sessionZone]);
+        $this->beforeApplicationDestroyed(static function (): void {
+            DB::statement('reset time zone');
+        });
+    }
+
+    $host = new ApprovalHost;
+    $host->bind();
+    $authorizer = app(Authorizer::class);
+    $approvals = app(Approvals::class);
+
+    $this->travelTo(now()->subMinutes(14)->startOfSecond());
+    $created = now();
+    $call = $host->call();
+    $lateDelivery = $host->call('late-delivery');
+    $authorizer->authorize($call);
+    $authorizer->authorize($lateDelivery);
+    $this->travelBack();
+
+    Queue::pushed(DeliverApproval::class)->first()->handle(app(ApprovalDelivery::class));
+    expect($host->inbox->cards($host->context->scope, 'alice'))->toHaveCount(1)
+        ->and($host->decideFromInbox('alice'))->toBeTrue();
+    ApprovalHost::runResumeJobs();
+    expect($approvals->receipt($call->id))->toBe(['status' => 'granted', 'outcome' => 'success']);
+
+    if ($sessionZone !== null) {
+        expect((float) DB::table('governance_approvals')
+            ->selectRaw('abs(extract(epoch from clock_timestamp() - decided_at)) as age')
+            ->whereNotNull('decided_at')->value('age'))->toBeLessThan(5)
+            ->and((float) DB::table('governance_invocations')
+                ->selectRaw('abs(extract(epoch from clock_timestamp() - outcome_recorded_at)) as age')
+                ->where('invocation_id', $call->id)->value('age'))->toBeLessThan(5);
+    }
+
+    $this->travelTo($created->copy()->addMinutes(15));
+    expect($approvals->receipt($lateDelivery->id))->toBe(['status' => 'expired'])
+        ->and($authorizer->authorize($lateDelivery)->status)->toBe('expired');
+    ApprovalHost::deliverCards();
+    expect($host->inbox->cards($host->context->scope, 'alice'))->toHaveCount(1);
+    app(ApprovalWork::class)->recover();
+    ApprovalHost::runResumeJobs();
+    expect($host->executions)->toHaveCount(1)
+        ->and(DB::table('governance_invocations')->where('invocation_id', $lateDelivery->id)->value('status'))->toBe('expired');
+})->with(getenv('DB_DATABASE') === false ? [
+    'SQLite with New York app' => ['America/New_York', null],
+    'SQLite with Tokyo app' => ['Asia/Tokyo', null],
+] : [
+    'New York app and session' => ['America/New_York', 'America/New_York'],
+    'Tokyo app and session' => ['Asia/Tokyo', 'Asia/Tokyo'],
+    'UTC app and Etc/UTC session' => ['UTC', 'Etc/UTC'],
+    'UTC app and New York session' => ['UTC', 'America/New_York'],
+    'UTC app and Tokyo session' => ['UTC', 'Asia/Tokyo'],
+    'New York app and Tokyo session' => ['America/New_York', 'Asia/Tokyo'],
+]);
+
 it('delivers one private card per human and resumes only after all decisions', function (bool $two, bool $sameHuman): void {
     $host = new ApprovalHost;
     if ($sameHuman) {
