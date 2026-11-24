@@ -5,10 +5,12 @@ declare(strict_types=1);
 use Illuminate\Contracts\Container\BindingResolutionException;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Queue;
 use Ocdejong\SharedToolGovernance\Approvals\ApprovalDecision;
 use Ocdejong\SharedToolGovernance\Approvals\ApprovalResumption;
 use Ocdejong\SharedToolGovernance\Approvals\Approvals;
+use Ocdejong\SharedToolGovernance\Approvals\ApprovalUndeliverable;
 use Ocdejong\SharedToolGovernance\Authorization\Authorizer;
 use Ocdejong\SharedToolGovernance\Contracts\ApprovalNotifier;
 use Ocdejong\SharedToolGovernance\Contracts\RuleEvaluator;
@@ -22,6 +24,7 @@ use Ocdejong\SharedToolGovernance\Jobs\DeliverApproval;
 use Ocdejong\SharedToolGovernance\Jobs\ResumeApproval;
 use Ocdejong\SharedToolGovernance\LocalInbox\LocalInbox;
 use Ocdejong\SharedToolGovernance\Models\GovernanceApproval;
+use Ocdejong\SharedToolGovernance\Models\GovernanceAuditEvent;
 use Ocdejong\SharedToolGovernance\Models\GovernanceGrant;
 use Ocdejong\SharedToolGovernance\Models\GovernanceInvocation;
 use Ocdejong\SharedToolGovernance\Models\GovernanceOutboxMessage;
@@ -281,6 +284,70 @@ it('records an uncertain downstream result without retrying execution', function
     expect($host->executions)->toHaveCount(1)
         ->and(app(Approvals::class)->receipt('visit'))->toBe(['status' => 'granted', 'outcome' => 'unknown']);
 });
+
+it('reports an unreachable owner after commit while the request keeps its expiry', function (
+    ?string $householdApprover,
+    array $approversByResource,
+    bool $allHouseholdOwned,
+): void {
+    $this->freezeSecond();
+    $host = new ApprovalHost;
+    $host->householdApprover = $householdApprover;
+    $host->approversByResource = $approversByResource;
+    $host->allHouseholdOwned = $allHouseholdOwned;
+    $host->bind();
+    $authorizer = app(Authorizer::class);
+    $call = $host->call(two: true);
+    $reported = [];
+    Event::listen(ApprovalUndeliverable::class, function (ApprovalUndeliverable $event) use (&$reported): void {
+        expect(DB::transactionLevel())->toBe(0);
+        $reported[] = $event;
+    });
+
+    DB::beginTransaction();
+    try {
+        $result = $authorizer->authorize($call);
+        expect($result->jsonSerialize())->toBe(['status' => 'pending_approval', 'request_id' => 'visit'])
+            ->and($result->grantToken())->toBeNull()
+            ->and(GovernanceApproval::query()->count())->toBe(0)
+            ->and(GovernanceOutboxMessage::query()->count())->toBe(0)
+            ->and(GovernanceGrant::query()->count())->toBe(0)
+            ->and($reported)->toBe([]);
+        Queue::assertNothingPushed();
+    } finally {
+        DB::rollBack();
+    }
+    expect($reported)->toBe([])
+        ->and(GovernanceAuditEvent::query()->count())->toBe(0);
+
+    DB::transaction(function () use ($authorizer, $call, &$reported): void {
+        $authorizer->authorize($call);
+        expect($reported)->toBe([]);
+    });
+    $authorizer->authorize($call);
+
+    expect($reported)->toHaveCount(1)
+        ->and($reported[0]->invocationId)->toBe($call->id)
+        ->and($reported[0]->scope)->toEqual($host->context->scope);
+    $audit = GovernanceAuditEvent::query()->where('event', 'approval_undeliverable')->sole();
+    expect($audit->getAttribute('invocation_row_id'))->toBe(GovernanceInvocation::query()->sole()->getKey())
+        ->and($audit->getAttribute('details'))->toBe([]);
+    Queue::assertNothingPushed();
+
+    $this->travel(14)->minutes();
+    expect(app(Approvals::class)->receipt($call->id))->toBe(['status' => 'pending_approval']);
+    $this->travel(1)->minutes();
+    expect(app(Approvals::class)->receipt($call->id))->toBe(['status' => 'expired']);
+    app(ApprovalWork::class)->recover();
+    ApprovalHost::runResumeJobs();
+    expect($host->executions)->toBe([]);
+})->with([
+    'no approver' => [null, [], false],
+    'empty approver' => ['', [], false],
+    'approver outside the scope' => ['stranger', [], false],
+    'approver is not the personal owner' => ['bob', ['personal' => 'bob'], false],
+    'conflicting approvers for one owner' => ['bob', ['personal' => 'alice'], true],
+]);
 
 it('stages the request and its cards together and enqueues delivery after commit', function (): void {
     $host = new ApprovalHost;

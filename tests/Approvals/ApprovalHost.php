@@ -48,6 +48,11 @@ final class ApprovalHost implements ResourceAuthority, ResumptionContext, RuleEv
 
     public ?string $householdApprover = 'bob';
 
+    public bool $allHouseholdOwned = false;
+
+    /** @var array<string, string> */
+    public array $approversByResource = [];
+
     public string $personalOwner = 'alice';
 
     public bool $deny = false;
@@ -163,7 +168,9 @@ final class ApprovalHost implements ResourceAuthority, ResumptionContext, RuleEv
     public function ownerOf(Scope $scope, ResourceReference $resource): ?OwnerReference
     {
         return match ($resource->id) {
-            'personal' => new OwnerReference(OwnerType::PERSON, $this->personalOwner),
+            'personal' => $this->allHouseholdOwned
+                ? new OwnerReference(OwnerType::HOUSEHOLD, $scope->householdId)
+                : new OwnerReference(OwnerType::PERSON, $this->personalOwner),
             'shared' => new OwnerReference(OwnerType::HOUSEHOLD, $scope->householdId),
             default => null,
         };
@@ -176,7 +183,8 @@ final class ApprovalHost implements ResourceAuthority, ResumptionContext, RuleEv
 
     public function approverFor(Scope $scope, ResourceReference $resource, OwnerReference $owner): ?string
     {
-        return $owner->type === OwnerType::PERSON ? $owner->id : $this->householdApprover;
+        return $this->approversByResource[$resource->id]
+            ?? ($owner->type === OwnerType::PERSON ? $owner->id : $this->householdApprover);
     }
 
     public function evaluate(Scope $scope, ResourceReference $resource, OwnerReference $owner, string $actionKey): RuleEvaluation

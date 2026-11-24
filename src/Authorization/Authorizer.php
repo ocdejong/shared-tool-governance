@@ -8,6 +8,7 @@ use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\DB;
 use Ocdejong\SharedToolGovernance\Activity\ActivityState;
 use Ocdejong\SharedToolGovernance\Approvals\ApprovalStore;
+use Ocdejong\SharedToolGovernance\Approvals\ApprovalUndeliverable;
 use Ocdejong\SharedToolGovernance\Data\Invocation;
 use Ocdejong\SharedToolGovernance\Data\Verdict;
 use Ocdejong\SharedToolGovernance\Grants\GrantService;
@@ -76,6 +77,9 @@ final readonly class Authorizer
         if ($requirements !== null) {
             ApprovalStore::stage($row, $frozen, $requirements);
             DB::afterCommit(static fn () => ApprovalWork::deliverFor((int) $row->getKey()));
+        } elseif ($status === 'pending_approval') {
+            InvocationStore::audit($row, 'approval_undeliverable');
+            event(new ApprovalUndeliverable($context->scope, $call->id));
         }
 
         return new AuthorizationResult($status, $call->id, $token);
