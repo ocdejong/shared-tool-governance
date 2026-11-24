@@ -2,13 +2,18 @@
 set -euo pipefail
 
 demo=false
+permission_tree=false
 if [[ ${1:-} == --demo ]]; then
     demo=true
     shift
 fi
+if [[ ${1:-} == --permission-tree ]]; then
+    permission_tree=true
+    shift
+fi
 
 if (( $# > 1 )) || [[ ${1:-} == --* ]]; then
-    echo 'Usage: bin/consumer-smoke [--demo] [commit]' >&2
+    echo 'Usage: bin/consumer-smoke [--demo] [--permission-tree] [commit]' >&2
     exit 2
 fi
 
@@ -167,6 +172,27 @@ echo "Installing target $target into the existing host database"
 install_package target
 artisan migrate --force
 check_database installed "$package_version"
+if "$permission_tree"; then
+    example="$scratch/target/examples/permission-tree"
+    cp "$example/PermissionTreeServiceProvider.php" app/Providers/
+    cp "$example/permission-tree.php" .
+    in_consumer php permission-tree.php install
+    cp "$database" "$scratch/permissions.sqlite"
+    (
+        database="$scratch/permissions.sqlite"
+        artisan config:cache
+        in_consumer php permission-tree.php
+        artisan config:clear
+    )
+    # Leave the two-owner demo with only its own fixture bindings and registrations.
+    in_consumer php -r '
+        $path = "bootstrap/providers.php";
+        $providers = array_values(array_filter(require $path, static fn ($provider) => $provider !== App\Providers\PermissionTreeServiceProvider::class));
+        if (file_put_contents($path, "<?php\n\nreturn ".var_export($providers, true).";\n") === false) {
+            exit(1);
+        }
+    '
+fi
 if "$demo"; then
     example="$scratch/target/examples/two-owner"
     cp "$example/TwoOwnerServiceProvider.php" app/Providers/

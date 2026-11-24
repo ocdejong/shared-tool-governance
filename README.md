@@ -64,6 +64,12 @@ Pauline or Olivier can settle the team's `any` rule in the shared chat. A late r
 
 The example uses fixture identities and a database-backed local inbox, with outbound HTTP blocked. Use your app's authenticated context and channel verification for real requests. See the [host integration guide](docs/integration.md) for those contracts.
 
+## Editable permission settings
+
+Register a tool's dotted `actionKey` once. `Rules\PermissionTree` derives editable groups from `ToolRegistry` and uses the existing rule evaluator to report each node's explicit setting, effective verdict and source. Save Allow, Ask me, Deny or Use parent through the same authorized, revision-checked resource rules used by dispatch. The host controls the screen and labels.
+
+See the [permission tree guide](docs/permission-tree.md) for registration, reads, edits and dispatch. From a repository checkout, run Pauline's calendar sequence in a disposable Laravel consumer with `bin/consumer-smoke --permission-tree HEAD`.
+
 ## Optional configuration
 
 The package uses your application's database, queue, scheduler and encryption key. To override the default durations, publish the config and edit `config/shared-tool-governance.php`.

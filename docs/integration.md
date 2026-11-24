@@ -25,6 +25,8 @@ Register each `Data\ToolDefinition` with the shared `Tools\ToolRegistry`. Keep t
 
 Use `ResourceRules::getRules($scope, $resource)` and `setRules($scope, $resource, $expectedRevision, $changes)` from authenticated settings code. Rules inherit along dotted action keys such as `calendar` and `calendar.availability`. Missing permission defaults to `DENY`.
 
+For an editable tree derived from those same tool registrations, use `Rules\PermissionTree::read($scope, $resource)` and `update($scope, $resource, $expectedRevision, $changes)`. The [permission tree guide](permission-tree.md) documents the node fields, inherited verdict sources, override patches and runnable calendar example.
+
 Call `ToolDiscovery::discover($scope, $targets, $mode, $namespace)` with host-selected `Discovery\DiscoveryTarget` values. `DiscoveryMode::ALL` reports visible permissions and unresolved actions. `DiscoveryMode::MATCH` returns actions with an `ALLOW` or `DELEGATE` verdict for every selected target. Dispatch still checks the exact call after a discovery match.
 
 ## Run a governed call

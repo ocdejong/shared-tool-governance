@@ -23,7 +23,7 @@ jobs:
       - run: composer install --no-interaction --no-progress
       - run: composer test
       - run: tests/Seam/eligible-groups/consumer.sh HEAD
-      - run: bin/consumer-smoke --demo HEAD
+      - run: bin/consumer-smoke --demo --permission-tree HEAD
       - run: bin/dist-install HEAD
       - if: github.event_name == 'push' && github.repository == 'ocdejong/shared-tool-governance'
         run: bin/dist-install --github HEAD
