@@ -13,6 +13,7 @@ use Illuminate\Support\Str;
 use Ocdejong\SharedToolGovernance\Approvals\Approvals;
 use Ocdejong\SharedToolGovernance\Authorization\Authorizer;
 use Ocdejong\SharedToolGovernance\Authorization\CallPolicy;
+use Ocdejong\SharedToolGovernance\Configuration;
 use Ocdejong\SharedToolGovernance\Contracts\RuleEvaluator;
 use Ocdejong\SharedToolGovernance\Jobs\ResumeApproval;
 use Ocdejong\SharedToolGovernance\Models\GovernanceApproval;
@@ -23,7 +24,7 @@ use Ocdejong\SharedToolGovernance\Rules\ResourceRules;
 use Ocdejong\SharedToolGovernance\Tests\Approvals\ApprovalHost;
 use Ocdejong\SharedToolGovernance\Tests\Authorization\Fixture;
 
-it('boots with package defaults and caches partial published overrides', function (): void {
+it('boots with package defaults and caches an env-backed published override', function (): void {
     $app = app();
     $root = sys_get_temp_dir().'/governance-config-'.Str::ulid();
     File::ensureDirectoryExists($root.'/bootstrap/cache');
@@ -52,7 +53,8 @@ it('boots with package defaults and caches partial published overrides', functio
 
         expect($kernel->call('vendor:publish', ['--tag' => 'shared-tool-governance-config']))->toBe(0, $kernel->output())
             ->and(File::getRequire($configPath))->toBe($defaults);
-        File::put($configPath, '<?php return ["approval_lifetime_minutes" => 7];');
+        File::put($root.'/.env', "STG_TEST_APPROVAL_LIFETIME_MINUTES=7\n");
+        File::put($configPath, '<?php return ["approval_lifetime_minutes" => env("STG_TEST_APPROVAL_LIFETIME_MINUTES", 15)];');
         expect($kernel->call('config:cache'))->toBe(0, $kernel->output());
 
         /** @var Application $cached */
@@ -61,9 +63,10 @@ it('boots with package defaults and caches partial published overrides', functio
         expect($cached->configurationIsCached())->toBeTrue()
             ->and($cached['config']->get('shared-tool-governance'))->toBe([
                 'grant_lifetime_minutes' => 5,
-                'approval_lifetime_minutes' => 7,
+                'approval_lifetime_minutes' => '7',
                 'retention_days' => 30,
-            ]);
+            ])
+            ->and(Configuration::duration('approval_lifetime_minutes'))->toBe(7);
     } finally {
         Application::setInstance($app);
         Facade::clearResolvedInstances();
@@ -72,7 +75,7 @@ it('boots with package defaults and caches partial published overrides', functio
     }
 });
 
-it('applies configured lifetimes at issuance and retention when pruning', function (): void {
+it('applies configured lifetimes at issuance and retention when pruning', function (int|string $grantMinutes, int|string $approvalMinutes, int|string $retentionDays): void {
     expect(Artisan::call('migrate'))->toBe(0, Artisan::output());
     $this->beforeApplicationDestroyed(function (): void {
         expect(Artisan::call('migrate:rollback'))->toBe(0, Artisan::output());
@@ -80,9 +83,9 @@ it('applies configured lifetimes at issuance and retention when pruning', functi
     Queue::fake();
 
     config([
-        'shared-tool-governance.grant_lifetime_minutes' => 2,
-        'shared-tool-governance.approval_lifetime_minutes' => 7,
-        'shared-tool-governance.retention_days' => 2,
+        'shared-tool-governance.grant_lifetime_minutes' => $grantMinutes,
+        'shared-tool-governance.approval_lifetime_minutes' => $approvalMinutes,
+        'shared-tool-governance.retention_days' => $retentionDays,
     ]);
 
     $fixture = new Fixture;
@@ -130,7 +133,54 @@ it('applies configured lifetimes at issuance and retention when pruning', functi
     $this->travelTo($now->copy()->addDays(2));
     expect(Artisan::call('shared-tool-governance:prune'))->toBe(0, Artisan::output())
         ->and($denied->refresh()->getRawOriginal('frozen_inputs'))->toBeNull();
-});
+})->with([
+    'integers' => [2, 7, 2],
+    'env strings' => ['2', '7', '02'],
+]);
+
+it('rejects invalid durations before issuing work or pruning private inputs', function (mixed $invalid): void {
+    expect(Artisan::call('migrate'))->toBe(0, Artisan::output());
+    $this->beforeApplicationDestroyed(function (): void {
+        expect(Artisan::call('migrate:rollback'))->toBe(0, Artisan::output());
+    });
+    Queue::fake();
+
+    $fixture = new Fixture;
+    config(['shared-tool-governance.grant_lifetime_minutes' => $invalid]);
+    expect(fn () => $fixture->authorizer->authorize($fixture->call()))
+        ->toThrow(InvalidArgumentException::class, 'shared-tool-governance.grant_lifetime_minutes');
+    expect(GovernanceGrant::query()->count())->toBe(0);
+
+    app()->forgetInstance(CallPolicy::class);
+    $host = new ApprovalHost;
+    $host->bind();
+    $authorizer = app(Authorizer::class);
+    config(['shared-tool-governance.approval_lifetime_minutes' => $invalid]);
+    expect(fn () => $authorizer->authorize($host->call('pending')))
+        ->toThrow(InvalidArgumentException::class, 'shared-tool-governance.approval_lifetime_minutes');
+    expect(GovernanceInvocation::query()->count())->toBe(0);
+    Queue::assertNothingPushed();
+
+    $host->deny = true;
+    expect($authorizer->authorize($host->call('denied'))->status)->toBe('denied');
+    $denied = GovernanceInvocation::query()->sole();
+    $inputs = $denied->getRawOriginal('frozen_inputs');
+    expect($inputs)->not->toBeNull();
+
+    $this->travel(1)->day();
+    config(['shared-tool-governance.retention_days' => $invalid]);
+    expect(fn () => Artisan::call('shared-tool-governance:prune'))
+        ->toThrow(InvalidArgumentException::class, 'shared-tool-governance.retention_days');
+    expect($denied->refresh()->getRawOriginal('frozen_inputs'))->toBe($inputs);
+})->with([
+    'non-numeric string' => ['tomorrow'],
+    'zero string' => ['0'],
+    'negative integer' => [-1],
+    'fractional string' => ['1.5'],
+    'overflowing string' => [str_repeat('9', 25)],
+    'above the duration limit' => ['2147483648'],
+    'boolean' => [true],
+]);
 
 it('expires a pending invocation seeded before the deadline migration on its original schedule', function (): void {
     $directory = dirname(__DIR__, 2).'/database/migrations';

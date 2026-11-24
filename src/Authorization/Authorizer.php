@@ -9,6 +9,7 @@ use Illuminate\Support\Facades\DB;
 use Ocdejong\SharedToolGovernance\Activity\ActivityState;
 use Ocdejong\SharedToolGovernance\Approvals\ApprovalStore;
 use Ocdejong\SharedToolGovernance\Approvals\ApprovalUndeliverable;
+use Ocdejong\SharedToolGovernance\Configuration;
 use Ocdejong\SharedToolGovernance\Data\Invocation;
 use Ocdejong\SharedToolGovernance\Data\Verdict;
 use Ocdejong\SharedToolGovernance\Grants\GrantService;
@@ -75,7 +76,7 @@ final readonly class Authorizer
             'created_at' => $issuedAt,
             'updated_at' => $issuedAt,
             'approval_expires_at' => $status === 'pending_approval'
-                ? $issuedAt->copy()->addMinutes(config()->integer('shared-tool-governance.approval_lifetime_minutes'))
+                ? $issuedAt->copy()->addMinutes(Configuration::duration('approval_lifetime_minutes'))
                 : null,
         ]);
         $token = $status === 'granted' ? GrantService::issue($row) : null;

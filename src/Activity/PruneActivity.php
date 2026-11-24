@@ -7,6 +7,7 @@ namespace Ocdejong\SharedToolGovernance\Activity;
 use Carbon\CarbonInterface;
 use Illuminate\Support\Facades\DB;
 use Ocdejong\SharedToolGovernance\Approvals\ApprovalStore;
+use Ocdejong\SharedToolGovernance\Configuration;
 use Ocdejong\SharedToolGovernance\Models\GovernanceInvocation;
 use Ocdejong\SharedToolGovernance\Models\GovernanceOutboxMessage;
 
@@ -16,7 +17,7 @@ final class PruneActivity
     public function prune(): int
     {
         $now = now();
-        $cutoff = $now->copy()->subDays(config()->integer('shared-tool-governance.retention_days'));
+        $cutoff = $now->copy()->subDays(Configuration::duration('retention_days'));
         $candidates = GovernanceInvocation::query();
         $candidates->where('created_at', '<=', $candidates->getModel()->fromDateTime($cutoff));
         $candidates->getQuery()->whereNotNull('frozen_inputs')->useWritePdo();

@@ -9,6 +9,7 @@ use Illuminate\Support\Facades\DB;
 use InvalidArgumentException;
 use Ocdejong\SharedToolGovernance\Authorization\CallPolicy;
 use Ocdejong\SharedToolGovernance\Authorization\InvocationStore;
+use Ocdejong\SharedToolGovernance\Configuration;
 use Ocdejong\SharedToolGovernance\Contracts\TrustedInvocationContext;
 use Ocdejong\SharedToolGovernance\Data\ExecutionResult;
 use Ocdejong\SharedToolGovernance\Data\ExecutionStatus;
@@ -32,7 +33,7 @@ final readonly class GrantService
     {
         $token = bin2hex(random_bytes(32));
         $now = DB::raw(GrantClock::sql());
-        $minutes = config()->integer('shared-tool-governance.grant_lifetime_minutes');
+        $minutes = Configuration::duration('grant_lifetime_minutes');
         GovernanceGrant::query()->insert([
             'invocation_row_id' => $invocation->getKey(),
             'token_hash' => hash('sha256', $token),
