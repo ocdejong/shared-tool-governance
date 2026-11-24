@@ -5,7 +5,11 @@ declare(strict_types=1);
 namespace Ocdejong\SharedToolGovernance\Tests\Approvals;
 
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Queue;
+use Ocdejong\SharedToolGovernance\Approvals\ApprovalDecision;
 use Ocdejong\SharedToolGovernance\Approvals\ApprovalPreview;
+use Ocdejong\SharedToolGovernance\Approvals\ApprovalResumption;
+use Ocdejong\SharedToolGovernance\Approvals\Approvals;
 use Ocdejong\SharedToolGovernance\Contracts\ApprovalNotifier;
 use Ocdejong\SharedToolGovernance\Contracts\ResourceAuthority;
 use Ocdejong\SharedToolGovernance\Contracts\ResumptionContext;
@@ -23,7 +27,11 @@ use Ocdejong\SharedToolGovernance\Data\RuleEvaluation;
 use Ocdejong\SharedToolGovernance\Data\Scope;
 use Ocdejong\SharedToolGovernance\Data\ToolDefinition;
 use Ocdejong\SharedToolGovernance\Data\Verdict;
+use Ocdejong\SharedToolGovernance\Data\VerifiedReply;
+use Ocdejong\SharedToolGovernance\Jobs\DeliverApproval;
+use Ocdejong\SharedToolGovernance\Jobs\ResumeApproval;
 use Ocdejong\SharedToolGovernance\LocalInbox\LocalInbox;
+use Ocdejong\SharedToolGovernance\Outbox\ApprovalDelivery;
 use Ocdejong\SharedToolGovernance\Tools\ToolRegistry;
 use RuntimeException;
 
@@ -98,6 +106,26 @@ final class ApprovalHost implements ResourceAuthority, ResumptionContext, RuleEv
             $id, 'reschedule', '1', ['two' => $two, 'scheduled_time' => '10:00', 'private_note' => 'private argument marker'],
             'Move the repair visit (private reason marker)', $this->context, $executor,
         );
+    }
+
+    public static function deliverCards(): void
+    {
+        Queue::pushed(DeliverApproval::class)
+            ->each(static fn (DeliverApproval $job) => $job->handle(app(ApprovalDelivery::class)));
+    }
+
+    public function decideFromInbox(string $person, ApprovalDecision $decision = ApprovalDecision::APPROVE): bool
+    {
+        $scope = $this->context->scope;
+        $card = $this->inbox->cards($scope, $person)[0];
+
+        return app(Approvals::class)->decide($card->approvalId, $decision, new VerifiedReply($scope, $person, $card->cardId, "reply-$person"));
+    }
+
+    public static function runResumeJobs(): void
+    {
+        Queue::pushed(ResumeApproval::class)
+            ->each(static fn (ResumeApproval $job) => $job->handle(app(ApprovalResumption::class)));
     }
 
     public function current(): InvocationContext

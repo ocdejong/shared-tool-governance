@@ -45,22 +45,7 @@ function requestApproval(ApprovalHost $host, bool $two = false): void
     expect($result->jsonSerialize())->toBe(['status' => 'pending_approval', 'request_id' => 'visit'])
         ->and($result->grantToken())->toBeNull();
 
-    Queue::pushed(DeliverApproval::class)
-        ->each(static fn (DeliverApproval $job) => $job->handle(app(ApprovalDelivery::class)));
-}
-
-function decideFromInbox(ApprovalHost $host, string $human, ApprovalDecision $decision = ApprovalDecision::APPROVE): bool
-{
-    $scope = $host->context->scope;
-    $card = $host->inbox->cards($scope, $human)[0];
-
-    return app(Approvals::class)->decide($card->approvalId, $decision, new VerifiedReply($scope, $human, $card->cardId, "reply-$human"));
-}
-
-function resumeApproved(): void
-{
-    Queue::pushed(ResumeApproval::class)
-        ->each(static fn (ResumeApproval $job) => $job->handle(app(ApprovalResumption::class)));
+    ApprovalHost::deliverCards();
 }
 
 it('delivers one private card per human and resumes only after all decisions', function (bool $two, bool $sameHuman): void {
@@ -89,14 +74,14 @@ it('delivers one private card per human and resumes only after all decisions', f
             ->and($bob[0]->message)->not->toContain('personal');
     }
 
-    expect(decideFromInbox($host, 'alice'))->toBeTrue()
-        ->and(decideFromInbox($host, 'alice'))->toBeTrue()
-        ->and(decideFromInbox($host, 'alice', ApprovalDecision::DECLINE))->toBeFalse();
+    expect($host->decideFromInbox('alice'))->toBeTrue()
+        ->and($host->decideFromInbox('alice'))->toBeTrue()
+        ->and($host->decideFromInbox('alice', ApprovalDecision::DECLINE))->toBeFalse();
     if ($two && ! $sameHuman) {
-        resumeApproved();
+        ApprovalHost::runResumeJobs();
         expect($host->executions)->toBe([])
             ->and(app(Approvals::class)->receipt('visit'))->toBe(['status' => 'pending_approval']);
-        expect(decideFromInbox($host, 'bob'))->toBeTrue();
+        expect($host->decideFromInbox('bob'))->toBeTrue();
     }
 
     Queue::fake(); // Simulate loss of the queued wakeup and rebuild work from committed state.
@@ -138,8 +123,8 @@ it('binds a decision to the verified scope, sender and original card', function 
         expect(app(Approvals::class)->decide($alice->approvalId, ApprovalDecision::APPROVE, $reply))->toBeFalse();
     }
 
-    expect(decideFromInbox($host, 'bob', ApprovalDecision::DECLINE))->toBeTrue();
-    resumeApproved();
+    expect($host->decideFromInbox('bob', ApprovalDecision::DECLINE))->toBeTrue();
+    ApprovalHost::runResumeJobs();
     expect($host->executions)->toBe([])
         ->and(app(Approvals::class)->receipt('visit'))->toBe(['status' => 'declined']);
 });
@@ -148,13 +133,13 @@ it('expires both unanswered cards and fully approved calls awaiting a worker', f
     $host = new ApprovalHost;
     requestApproval($host);
     if ($approve) {
-        expect(decideFromInbox($host, 'alice'))->toBeTrue();
+        expect($host->decideFromInbox('alice'))->toBeTrue();
     }
 
     $this->travel(30)->minutes();
-    expect(decideFromInbox($host, 'alice', ApprovalDecision::DECLINE))->toBeFalse();
+    expect($host->decideFromInbox('alice', ApprovalDecision::DECLINE))->toBeFalse();
     app(ApprovalWork::class)->recover();
-    resumeApproved();
+    ApprovalHost::runResumeJobs();
     expect($host->executions)->toBe([])
         ->and(app(Approvals::class)->receipt('visit'))->toBe(['status' => 'expired']);
 })->with([false, true]);
@@ -162,8 +147,8 @@ it('expires both unanswered cards and fully approved calls awaiting a worker', f
 it('rechecks current authority against the frozen call before execution', function (string $change): void {
     $host = new ApprovalHost;
     requestApproval($host, true);
-    expect(decideFromInbox($host, 'alice'))->toBeTrue()
-        ->and(decideFromInbox($host, 'bob'))->toBeTrue();
+    expect($host->decideFromInbox('alice'))->toBeTrue()
+        ->and($host->decideFromInbox('bob'))->toBeTrue();
 
     $original = $host->context;
     match ($change) {
@@ -180,7 +165,7 @@ it('rechecks current authority against the frozen call before execution', functi
         default => throw new LogicException('Unknown fixture change.'),
     };
     $host->workerOnly = true;
-    resumeApproved();
+    ApprovalHost::runResumeJobs();
 
     $host->workerOnly = false;
     if (in_array($change, ['scope', 'requester', 'runtime'], true)) {
@@ -195,17 +180,17 @@ it('rechecks current authority against the frozen call before execution', functi
 it('reports an approved grant that expired unused after the worker stopped', function (): void {
     $host = new ApprovalHost;
     requestApproval($host);
-    expect(decideFromInbox($host, 'alice'))->toBeTrue();
+    expect($host->decideFromInbox('alice'))->toBeTrue();
     $host->checksAfterApproval = 0;
     $host->interrupt = true;
-    expect(resumeApproved(...))->toThrow(RuntimeException::class, 'Worker stopped after issuance.');
+    expect(ApprovalHost::runResumeJobs(...))->toThrow(RuntimeException::class, 'Worker stopped after issuance.');
 
     DB::table('governance_grants')->update(['expires_at' => now()->subDay()]);
     $this->travel(-3)->days();
     $host->interrupt = false;
     app(ApprovalWork::class)->recover();
     Queue::assertPushed(ResumeApproval::class, 2);
-    resumeApproved();
+    ApprovalHost::runResumeJobs();
     expect($host->executions)->toBe([])
         ->and(app(Approvals::class)->receipt('visit'))->toBe(['status' => 'approved_unused']);
 });
@@ -213,10 +198,10 @@ it('reports an approved grant that expired unused after the worker stopped', fun
 it('leaves a grant unused when authority changes between its issuance and redemption', function (): void {
     $host = new ApprovalHost;
     requestApproval($host);
-    expect(decideFromInbox($host, 'alice'))->toBeTrue();
+    expect($host->decideFromInbox('alice'))->toBeTrue();
     $host->checksAfterApproval = 0;
     $host->denyAtRedemption = true;
-    resumeApproved();
+    ApprovalHost::runResumeJobs();
 
     expect($host->executions)->toBe([])
         ->and(app(Approvals::class)->receipt('visit'))->toBe(['status' => 'approved_unused']);
@@ -226,9 +211,9 @@ it('records an uncertain downstream result without retrying execution', function
     $host = new ApprovalHost;
     requestApproval($host);
     $host->timeout = true;
-    expect(decideFromInbox($host, 'alice'))->toBeTrue();
-    resumeApproved();
-    resumeApproved();
+    expect($host->decideFromInbox('alice'))->toBeTrue();
+    ApprovalHost::runResumeJobs();
+    ApprovalHost::runResumeJobs();
 
     expect($host->executions)->toHaveCount(1)
         ->and(app(Approvals::class)->receipt('visit'))->toBe(['status' => 'granted', 'outcome' => 'unknown']);
@@ -280,16 +265,15 @@ it('recovers undelivered work and retries delivery with the same private card ID
     app()->instance(ApprovalNotifier::class, $flaky);
     $job = Queue::pushed(DeliverApproval::class)->sole();
     expect(fn () => $job->handle(app(ApprovalDelivery::class)))->toThrow(RuntimeException::class, 'Delivery confirmation was lost.');
-    expect(decideFromInbox($host, 'alice'))->toBeFalse();
+    expect($host->decideFromInbox('alice'))->toBeFalse();
 
     Queue::fake();
     app(ApprovalWork::class)->recover();
-    Queue::pushed(DeliverApproval::class)
-        ->each(static fn (DeliverApproval $job) => $job->handle(app(ApprovalDelivery::class)));
+    ApprovalHost::deliverCards();
 
     expect($host->inbox->cards($host->context->scope, 'alice'))->toHaveCount(1)
-        ->and(decideFromInbox($host, 'alice'))->toBeTrue();
-    resumeApproved();
+        ->and($host->decideFromInbox('alice'))->toBeTrue();
+    ApprovalHost::runResumeJobs();
     expect($host->executions)->toHaveCount(1);
 });
 
@@ -310,15 +294,14 @@ it('honors an owner turning off access while another approval is outstanding', f
     $rules->setRules($scope, $shared, 0, $delegation);
     $host->context = $original;
     expect(app(Authorizer::class)->authorize($host->call(two: true))->status)->toBe('pending_approval');
-    Queue::pushed(DeliverApproval::class)
-        ->each(static fn (DeliverApproval $job) => $job->handle(app(ApprovalDelivery::class)));
-    expect(decideFromInbox($host, 'alice'))->toBeTrue();
+    ApprovalHost::deliverCards();
+    expect($host->decideFromInbox('alice'))->toBeTrue();
 
     $host->context = new InvocationContext($scope, 'alice', 'runtime', ['alice']);
     $rules->setRules($scope, $personal, 1, ['enabled' => false]);
     $host->context = $original;
-    expect(decideFromInbox($host, 'bob'))->toBeTrue();
-    resumeApproved();
+    expect($host->decideFromInbox('bob'))->toBeTrue();
+    ApprovalHost::runResumeJobs();
 
     expect($host->executions)->toBe([])
         ->and(app(Approvals::class)->receipt('visit'))->toBe(['status' => 'revoked']);
@@ -341,13 +324,13 @@ it('removes private card content and execution arguments after use', function (s
         ->and($approval->refresh()->getAttribute('preview'))->toContain('Move the repair visit');
 
     match ($status) {
-        'granted' => expect(decideFromInbox($host, 'alice'))->toBeTrue(),
-        'declined' => expect(decideFromInbox($host, 'alice', ApprovalDecision::DECLINE))->toBeTrue(),
+        'granted' => expect($host->decideFromInbox('alice'))->toBeTrue(),
+        'declined' => expect($host->decideFromInbox('alice', ApprovalDecision::DECLINE))->toBeTrue(),
         'expired' => $this->travel(30)->minutes(),
         default => throw new LogicException('Unknown receipt status.'),
     };
     app(ApprovalWork::class)->recover();
-    resumeApproved();
+    ApprovalHost::runResumeJobs();
 
     $receipt = $status === 'granted' ? ['status' => $status, 'outcome' => 'success'] : ['status' => $status];
     expect(app(Approvals::class)->receipt('visit'))->toBe($receipt)
@@ -364,10 +347,9 @@ it('resumes with the registered executor even when the proposal names a differen
     app()->instance('caller-worker', app(ToolExecutor::class));
 
     expect(app(Authorizer::class)->authorize($host->call(executor: 'caller-worker'))->status)->toBe('pending_approval');
-    Queue::pushed(DeliverApproval::class)
-        ->each(static fn (DeliverApproval $job) => $job->handle(app(ApprovalDelivery::class)));
-    expect(decideFromInbox($host, 'alice'))->toBeTrue();
-    resumeApproved();
+    ApprovalHost::deliverCards();
+    expect($host->decideFromInbox('alice'))->toBeTrue();
+    ApprovalHost::runResumeJobs();
 
     expect($host->executions)->toHaveCount(1)
         ->and($host->executions[0]->executorId)->toBe('worker');
@@ -376,11 +358,11 @@ it('resumes with the registered executor even when the proposal names a differen
 it('refuses a resumed grant when ownership changes after issuance', function (): void {
     $host = new ApprovalHost;
     requestApproval($host);
-    expect(decideFromInbox($host, 'alice'))->toBeTrue();
+    expect($host->decideFromInbox('alice'))->toBeTrue();
     $host->checksAfterApproval = 0;
     $host->ownerAtRedemption = 'bob';
 
-    resumeApproved();
+    ApprovalHost::runResumeJobs();
 
     expect($host->executions)->toBe([])
         ->and(GovernanceGrant::query()->sole()->getAttribute('redeemed_at'))->toBeNull()
@@ -390,7 +372,7 @@ it('refuses a resumed grant when ownership changes after issuance', function ():
 it('refuses mismatched grant tokens when resuming approved work', function (string $source): void {
     $host = new ApprovalHost;
     requestApproval($host);
-    expect(decideFromInbox($host, 'alice'))->toBeTrue();
+    expect($host->decideFromInbox('alice'))->toBeTrue();
     $host->checksAfterApproval = 0;
 
     $original = $host->context;
@@ -428,7 +410,7 @@ it('refuses mismatched grant tokens when resuming approved work', function (stri
         ]);
     });
 
-    resumeApproved();
+    ApprovalHost::runResumeJobs();
 
     expect($host->executions)->toBe([])
         ->and(GovernanceGrant::query()->whereNotNull('redeemed_at')->count())->toBe(0)
@@ -438,13 +420,13 @@ it('refuses mismatched grant tokens when resuming approved work', function (stri
 it('keeps approved work retryable when the executor cannot be resolved', function (bool $bound): void {
     $host = new ApprovalHost;
     requestApproval($host);
-    expect(decideFromInbox($host, 'alice'))->toBeTrue();
+    expect($host->decideFromInbox('alice'))->toBeTrue();
     app()->forgetInstance('worker');
     if ($bound) {
         app()->instance('worker', new stdClass);
     }
 
-    expect(resumeApproved(...))->toThrow($bound ? InvalidArgumentException::class : BindingResolutionException::class)
+    expect(ApprovalHost::runResumeJobs(...))->toThrow($bound ? InvalidArgumentException::class : BindingResolutionException::class)
         ->and($host->executions)->toBe([])
         ->and(GovernanceGrant::query()->count())->toBe(0)
         ->and(GovernanceInvocation::query()->sole()->getAttribute('outcome'))->toBeNull()
@@ -454,7 +436,7 @@ it('keeps approved work retryable when the executor cannot be resolved', functio
     Queue::fake();
     app(ApprovalWork::class)->recover();
     Queue::assertPushed(ResumeApproval::class, 1);
-    resumeApproved();
+    ApprovalHost::runResumeJobs();
     expect($host->executions)->toHaveCount(1)
         ->and(app(Approvals::class)->receipt('visit'))->toBe(['status' => 'granted', 'outcome' => 'success']);
 })->with(['wrong type' => true, 'missing binding' => false]);

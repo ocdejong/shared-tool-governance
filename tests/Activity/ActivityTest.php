@@ -6,8 +6,6 @@ use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Queue;
 use Ocdejong\SharedToolGovernance\Activity\Activity;
-use Ocdejong\SharedToolGovernance\Approvals\ApprovalDecision;
-use Ocdejong\SharedToolGovernance\Approvals\ApprovalResumption;
 use Ocdejong\SharedToolGovernance\Approvals\Approvals;
 use Ocdejong\SharedToolGovernance\Authorization\Authorizer;
 use Ocdejong\SharedToolGovernance\Contracts\RuleEvaluator;
@@ -17,13 +15,9 @@ use Ocdejong\SharedToolGovernance\Data\InvocationContext;
 use Ocdejong\SharedToolGovernance\Data\ResourceReference;
 use Ocdejong\SharedToolGovernance\Data\Scope;
 use Ocdejong\SharedToolGovernance\Data\Verdict;
-use Ocdejong\SharedToolGovernance\Data\VerifiedReply;
 use Ocdejong\SharedToolGovernance\Grants\GrantService;
 use Ocdejong\SharedToolGovernance\Grants\RedemptionRefused;
-use Ocdejong\SharedToolGovernance\Jobs\DeliverApproval;
-use Ocdejong\SharedToolGovernance\Jobs\ResumeApproval;
 use Ocdejong\SharedToolGovernance\Models\GovernanceInvocation;
-use Ocdejong\SharedToolGovernance\Outbox\ApprovalDelivery;
 use Ocdejong\SharedToolGovernance\Rules\ResourceRules;
 use Ocdejong\SharedToolGovernance\Tests\Approvals\ApprovalHost;
 
@@ -38,20 +32,6 @@ beforeEach(function (): void {
 function activityViewer(ApprovalHost $host, string $person): void
 {
     $host->context = new InvocationContext($host->context->scope, $person, 'activity-ui', [$person]);
-}
-
-function deliverActivityCards(): void
-{
-    Queue::pushed(DeliverApproval::class)
-        ->each(static fn (DeliverApproval $job) => $job->handle(app(ApprovalDelivery::class)));
-}
-
-function answerActivityCard(ApprovalHost $host, string $person): bool
-{
-    $scope = $host->context->scope;
-    $card = $host->inbox->cards($scope, $person)[0];
-
-    return app(Approvals::class)->decide($card->approvalId, ApprovalDecision::APPROVE, new VerifiedReply($scope, $person, $card->cardId, "reply-$person"));
 }
 
 it('shows only the targets each viewer can manage in their current scope', function (): void {
@@ -102,8 +82,8 @@ it('shows decided approvals and the outcome according to the viewer', function (
     $requester = $host->context;
     $call = $host->call(two: true);
     app(Authorizer::class)->authorize($call);
-    deliverActivityCards();
-    expect(answerActivityCard($host, 'alice'))->toBeTrue();
+    ApprovalHost::deliverCards();
+    expect($host->decideFromInbox('alice'))->toBeTrue();
     $aliceDecidedAt = now()->toIso8601String();
 
     $activity = app(Activity::class);
@@ -119,10 +99,9 @@ it('shows decided approvals and the outcome according to the viewer', function (
     }
 
     $host->context = $requester;
-    expect(answerActivityCard($host, 'bob'))->toBeTrue();
+    expect($host->decideFromInbox('bob'))->toBeTrue();
     $bobDecidedAt = now()->toIso8601String();
-    Queue::pushed(ResumeApproval::class)
-        ->each(static fn (ResumeApproval $job) => $job->handle(app(ApprovalResumption::class)));
+    ApprovalHost::runResumeJobs();
     expect(app(Approvals::class)->receipt($call->id))->toBe(['status' => 'granted', 'outcome' => 'success']);
 
     activityViewer($host, $viewer);
@@ -171,10 +150,10 @@ it('revokes a waiting call or queued resumption without executing', function (st
     $host->bind();
     $original = $host->context;
     app(Authorizer::class)->authorize($host->call(two: true));
-    deliverActivityCards();
-    expect(answerActivityCard($host, 'alice'))->toBeTrue();
+    ApprovalHost::deliverCards();
+    expect($host->decideFromInbox('alice'))->toBeTrue();
     if ($fullyApproved) {
-        expect(answerActivityCard($host, 'bob'))->toBeTrue();
+        expect($host->decideFromInbox('bob'))->toBeTrue();
     }
 
     activityViewer($host, $revoker);
@@ -183,10 +162,9 @@ it('revokes a waiting call or queued resumption without executing', function (st
         ->and($activity->revoke('visit'))->toBeFalse();
     $host->context = $original;
     if (! $fullyApproved) {
-        expect(answerActivityCard($host, 'bob'))->toBeFalse();
+        expect($host->decideFromInbox('bob'))->toBeFalse();
     }
-    Queue::pushed(ResumeApproval::class)
-        ->each(static fn (ResumeApproval $job) => $job->handle(app(ApprovalResumption::class)));
+    ApprovalHost::runResumeJobs();
     expect($host->executions)->toBe([])
         ->and($activity->recentUse('visit')[0]['status'] ?? null)->toBe('revoked')
         ->and(DB::table('governance_grants')->count())->toBe(0);
@@ -196,15 +174,14 @@ it('revokes a pending call on resumption when its frozen reason is missing', fun
     $host = new ApprovalHost;
     $host->bind();
     app(Authorizer::class)->authorize($host->call());
-    deliverActivityCards();
+    ApprovalHost::deliverCards();
     $row = GovernanceInvocation::query()->firstOrFail();
     $inputs = $row->getAttribute('frozen_inputs');
     unset($inputs['reason']);
     $row->forceFill(['frozen_inputs' => $inputs])->save();
 
-    expect(answerActivityCard($host, 'alice'))->toBeTrue();
-    Queue::pushed(ResumeApproval::class)
-        ->each(static fn (ResumeApproval $job) => $job->handle(app(ApprovalResumption::class)));
+    expect($host->decideFromInbox('alice'))->toBeTrue();
+    ApprovalHost::runResumeJobs();
     expect(app(Approvals::class)->receipt('visit'))->toBe(['status' => 'revoked'])
         ->and($host->executions)->toBe([]);
 });
