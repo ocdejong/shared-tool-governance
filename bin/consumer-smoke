@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (( $# > 1 )); then
+    echo 'Usage: bin/consumer-smoke [commit]' >&2
+    exit 2
+fi
+
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+target=$(git -C "$repo" rev-parse --verify --end-of-options "${1:-HEAD}^{commit}")
+seam=$(git -C "$repo" rev-parse --verify 'b4ceea1^{commit}')
+scratch=$(mktemp -d)
+trap 'rm -rf -- "$scratch"' EXIT
+
+for stage in seam target; do
+    mkdir "$scratch/$stage"
+    git -C "$repo" archive "${!stage}" | tar -x -C "$scratch/$stage"
+done
+
+export COMPOSER_CACHE_DIR="${COMPOSER_CACHE_DIR:-$HOME/.cache/composer}"
+
+# Give Artisan and Composer's Artisan hooks the same isolated database configuration.
+in_consumer() {
+    env -i PATH="$PATH" HOME="$HOME" COMPOSER_HOME="$scratch/composer" \
+        COMPOSER_CACHE_DIR="$COMPOSER_CACHE_DIR" APP_ENV=testing \
+        DB_CONNECTION=sqlite DB_DATABASE="$database" DB_FOREIGN_KEYS=true \
+        QUEUE_CONNECTION=database "$@"
+}
+
+compose() {
+    in_consumer composer --no-interaction --no-ansi --no-plugins "$@"
+}
+
+artisan() {
+    in_consumer php artisan "$@"
+}
+
+check_database() {
+    in_consumer php -- "$@" <<'PHP'
+<?php
+
+declare(strict_types=1);
+
+use Composer\InstalledVersions;
+use Illuminate\Contracts\Console\Kernel;
+use Illuminate\Support\Facades\DB;
+use Ocdejong\SharedToolGovernance\GovernanceServiceProvider;
+
+require 'vendor/autoload.php';
+
+$app = require 'bootstrap/app.php';
+$app->make(Kernel::class)->bootstrap();
+
+function check(bool $condition, string $message): void
+{
+    if (! $condition) {
+        fwrite(STDERR, $message.PHP_EOL);
+        exit(1);
+    }
+}
+
+check(config('queue.default') === 'database', 'Expected the database queue.');
+
+$mode = $argv[1];
+
+if ($mode === 'seed-host') {
+    DB::table('users')->insert(['id' => 1, 'name' => 'Smoke Host', 'email' => 'host@example.test', 'password' => 'unused']);
+    DB::table('jobs')->insert([
+        'id' => 1,
+        'queue' => 'smoke',
+        'payload' => '{}',
+        'attempts' => 0,
+        'available_at' => 1,
+        'created_at' => 1,
+    ]);
+
+    file_put_contents(getenv('DB_DATABASE').'.tables', json_encode(DB::getSchemaBuilder()->getTableListing(), JSON_THROW_ON_ERROR));
+    exit(0);
+}
+
+check(DB::table('users')->where('id', 1)->value('email') === 'host@example.test', 'Host user row changed.');
+check(DB::table('jobs')->where('id', 1)->value('payload') === '{}', 'Host queue row changed.');
+
+$hostTables = json_decode(file_get_contents(getenv('DB_DATABASE').'.tables'), true, flags: JSON_THROW_ON_ERROR);
+$tables = DB::getSchemaBuilder()->getTableListing();
+check(array_diff($hostTables, $tables) === [], 'A host table is missing.');
+
+if ($mode === 'rolled-back') {
+    check($tables === $hostTables, 'Rollback did not restore the host table list.');
+    exit(0);
+}
+
+check($app->getProvider(GovernanceServiceProvider::class) !== null, 'Governance provider was not auto-discovered.');
+check(
+    InstalledVersions::getPrettyVersion('ocdejong/shared-tool-governance') === $argv[2],
+    'Composer did not install the requested governance package revision.',
+);
+
+$governanceTables = [
+    'governance_resource_bindings',
+    'governance_rule_revisions',
+    'governance_invocations',
+    'governance_approvals',
+    'governance_grants',
+    'governance_outbox_messages',
+    'governance_audit_events',
+];
+
+foreach ($governanceTables as $table) {
+    check(DB::getSchemaBuilder()->hasTable($table), "Missing table: $table");
+}
+
+$bindings = DB::table('governance_resource_bindings');
+if ($mode === 'seed-seam') {
+    $bindings->insert([
+        'host_scope' => 'smoke',
+        'household_id' => 'home',
+        'resource_type' => 'item',
+        'resource_id' => 'existing-item',
+        'owner_type' => 'person',
+        'owner_id' => 'existing-owner',
+    ]);
+}
+
+if ($mode === 'upgraded') {
+    check($bindings->where('resource_id', 'existing-item')->value('owner_id') === 'existing-owner', 'Seam governance row changed.');
+}
+PHP
+}
+
+install_package() {
+    local stage=$1
+    package_version="dev-smoke-$stage-${!stage}"
+
+    compose config repositories.governance \
+        "{\"type\":\"path\",\"url\":\"../$stage\",\"options\":{\"symlink\":false,\"versions\":{\"ocdejong/shared-tool-governance\":\"$package_version\"}}}"
+    compose require --update-no-dev --no-progress "ocdejong/shared-tool-governance:$package_version"
+}
+
+database="$scratch/consumer/database/database.sqlite"
+compose create-project --no-dev --no-scripts --prefer-dist --no-progress \
+    laravel/laravel "$scratch/consumer" '^13.0'
+cd "$scratch/consumer"
+
+touch "$database"
+artisan migrate --force
+check_database seed-host
+cp -a "$scratch/consumer" "$scratch/upgrade-consumer"
+
+echo "Installing target $target into the existing host database"
+install_package target
+artisan migrate --force
+check_database installed "$package_version"
+artisan migrate:rollback --force
+check_database rolled-back
+
+cd "$scratch/upgrade-consumer"
+database="$scratch/upgrade-consumer/database/database.sqlite"
+echo "Installing seam $seam into the upgrade database"
+install_package seam
+artisan migrate --force
+check_database seed-seam "$package_version"
+
+echo "Upgrading the seam consumer to target $target"
+install_package target
+artisan migrate --force
+check_database upgraded "$package_version"
+
+in_consumer php --version | sed -n '1p'
+compose --version
+artisan --version
+in_consumer php -r 'echo "SQLite ", (new PDO("sqlite::memory:"))->query("select sqlite_version()")->fetchColumn(), PHP_EOL;'
+echo 'Consumer smoke passed: target install, rollback, and seam upgrade.'
