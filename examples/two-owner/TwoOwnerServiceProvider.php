@@ -93,9 +93,18 @@ final class TwoOwnerServiceProvider extends ServiceProvider implements ResourceA
         return new InvocationContext(self::scope(), $this->viewer, 'demo-runtime', self::MEMBERS);
     }
 
+    public function viewAs(string $person): void
+    {
+        if (! $this->isMember(self::scope(), $person)) {
+            throw new InvalidArgumentException('Expected a member of the demo household.');
+        }
+
+        $this->viewer = $person;
+    }
+
     public function forInvocation(Scope $scope, string $invocationId): ?InvocationContext
     {
-        $request = Cache::store('database')->get('demo.request');
+        $request = Cache::store('database')->get('demo.request-context');
         if (! is_array($request) || $request['id'] !== $invocationId || ! $this->isMember($scope, $request['requester'])) {
             return null;
         }

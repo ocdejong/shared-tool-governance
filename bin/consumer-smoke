@@ -24,11 +24,12 @@ for stage in seam target; do
 done
 
 export COMPOSER_CACHE_DIR="${COMPOSER_CACHE_DIR:-$HOME/.cache/composer}"
+smoke_key=$(php -r 'echo "base64:".base64_encode(random_bytes(32));')
 
 # Give Artisan and Composer's Artisan hooks the same isolated database configuration.
 in_consumer() {
     env -i PATH="$PATH" HOME="$HOME" COMPOSER_HOME="$scratch/composer" \
-        COMPOSER_CACHE_DIR="$COMPOSER_CACHE_DIR" APP_ENV=testing \
+        COMPOSER_CACHE_DIR="$COMPOSER_CACHE_DIR" APP_ENV=testing APP_KEY="$smoke_key" \
         DB_CONNECTION=sqlite DB_DATABASE="$database" DB_FOREIGN_KEYS=true \
         QUEUE_CONNECTION=database "$@"
 }
@@ -177,10 +178,9 @@ if "$demo"; then
             exit(1);
         }
     '
-    demo_key=$(in_consumer php -r 'echo "base64:".base64_encode(random_bytes(32));')
-    in_consumer env APP_KEY="$demo_key" php "$example/demo.php" prepare
-    in_consumer env APP_KEY="$demo_key" php artisan queue:work --once --queue=default --tries=1
-    in_consumer env APP_KEY="$demo_key" php "$example/demo.php" verify
+    in_consumer php "$example/demo.php" prepare
+    artisan queue:work --once --queue=default --tries=1
+    in_consumer php "$example/demo.php" verify
 fi
 artisan migrate:rollback --force
 check_database rolled-back

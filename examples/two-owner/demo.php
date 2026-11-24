@@ -8,6 +8,7 @@ use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
+use Ocdejong\SharedToolGovernance\Activity\Activity;
 use Ocdejong\SharedToolGovernance\Approvals\ApprovalDecision;
 use Ocdejong\SharedToolGovernance\Approvals\Approvals;
 use Ocdejong\SharedToolGovernance\Authorization\Authorizer;
@@ -17,6 +18,8 @@ use Ocdejong\SharedToolGovernance\Data\VerifiedReply;
 use Ocdejong\SharedToolGovernance\Discovery\DiscoveryMode;
 use Ocdejong\SharedToolGovernance\Discovery\ToolDiscovery;
 use Ocdejong\SharedToolGovernance\LocalInbox\LocalInbox;
+
+const REASON = 'Find a time for our planning call.';
 
 function check(bool $condition, string $message): void
 {
@@ -44,8 +47,6 @@ function runDemo(string $phase): void
     check(Http::preventingStrayRequests(), 'Stray HTTP must be blocked in the demo.');
 
     if ($phase === 'verify') {
-        $receipt = $approvals->receipt($callId);
-        check($receipt === ['status' => 'granted', 'outcome' => 'success'], 'The resumed call did not succeed.');
         check($cache->get('demo.executions') === 1, 'Expected one executor call after the restart.');
         check($jobs->count() === 0 && DB::table('failed_jobs')->count() === 0, 'The worker left queued or failed jobs.');
         check(DB::table('governance_grants')->count() === 1
@@ -55,21 +56,26 @@ function runDemo(string $phase): void
         check($suggestions === ['suggestions' => ['10:00–10:30']], 'Expected only the shared suggestion in the model result.');
         show('Model result', $suggestions);
 
-        $request = $cache->get('demo.request');
-        $approval = $cache->get('demo.approval');
-        check(is_array($request) && is_array($approval), 'Host receipt data is missing.');
-        check($approval['sender'] === 'Pauline' && $request['requester'] === 'Tom'
-            && $request['reason'] === 'Find a time for our planning call.', 'Unexpected receipt identity or reason.');
-        show('Requester receipt', [
-            'requester' => $request['requester'],
-            'reason' => $request['reason'],
-            'approver' => $approval['sender'],
-            'outcome' => $receipt['outcome'] ?? null,
-        ]);
+        $activity = app(Activity::class);
+        foreach (['Tom', 'Pauline'] as $viewer) {
+            $host->viewAs($viewer);
+            $receipts = $activity->recentUse($callId);
+            check(count($receipts) === 1, "Expected one receipt for {$viewer}.");
+            $receipt = $receipts[0];
+            check($receipt['status'] === 'granted' && ($receipt['outcome'] ?? null) === 'success'
+                && $receipt['requester_id'] === 'Tom'
+                && array_column($receipt['approvals'], 'approver_id') === ['Pauline']
+                && array_column($receipt['approvals'], 'decision') === [ApprovalDecision::APPROVE->value],
+                "Expected {$viewer}'s receipt to show Tom's request, Pauline's approval and success.");
+            if ($viewer === 'Tom') {
+                check(($receipt['reason'] ?? null) === REASON, 'Tom should see his recorded reason.');
+            } else {
+                check(! array_key_exists('reason', $receipt)
+                    && array_column($receipt['targets'] ?? [], 'id') === ['pauline-calendar'], 'Pauline should see only her calendar and no reason.');
+            }
 
-        $reply = new VerifiedReply($host->current()->scope, $approval['sender'], $approval['card'], $approval['reply']);
-        check($approvals->decide($approval['id'], ApprovalDecision::APPROVE, $reply), 'A duplicate reply should be idempotent.');
-        check($jobs->count() === 0 && $cache->get('demo.executions') === 1, 'The repeat reply queued or ran the call again.');
+            show("Private receipt for {$viewer}", $receipt);
+        }
         echo 'Two-owner demo passed. One executor call after a fresh worker start.'.PHP_EOL;
 
         return;
@@ -109,15 +115,14 @@ function runDemo(string $phase): void
         'joint_availability',
         '1',
         ['date' => '2026-12-02'],
-        'Find a time for our planning call.',
+        REASON,
         $context,
         TwoOwnerServiceProvider::class,
     );
-    $cache->put('demo.request', [
+    $cache->put('demo.request-context', [
         'id' => $request->id,
         'requester' => $context->requesterId,
         'runtime' => $context->runtimeId,
-        'reason' => $request->reason,
     ]);
     $result = app(Authorizer::class)->authorize($request);
     check($result->jsonSerialize() === ['status' => 'pending_approval', 'request_id' => $callId]
@@ -130,19 +135,15 @@ function runDemo(string $phase): void
     check(count($cards) === 1 && $inbox->cards($scope, 'Tom') === [], 'Only Pauline should receive one private card.');
     $card = $cards[0];
     check(str_contains($card->message, 'Requester: Tom')
-        && str_contains($card->message, 'Find a time for our planning call.')
+        && str_contains($card->message, REASON)
         && str_contains($card->message, 'Suggest common times for 2026-12-02'),
         'The card should describe the exact request.');
     echo 'Private approval card delivered to Pauline.'.PHP_EOL;
 
     $reply = new VerifiedReply($scope, 'Pauline', $card->cardId, 'demo-pauline-reply');
     check($approvals->decide($card->approvalId, ApprovalDecision::APPROVE, $reply), 'The verified reply from Pauline was refused.');
-    $cache->put('demo.approval', [
-        'id' => $card->approvalId,
-        'sender' => $reply->senderId,
-        'card' => $reply->cardId,
-        'reply' => $reply->replyId,
-    ]);
+    check($jobs->count() === 1, 'Expected one queued resume job after approval.');
+    check($approvals->decide($card->approvalId, ApprovalDecision::APPROVE, $reply), 'A duplicate reply should be idempotent.');
     check($approvals->receipt($callId) === ['status' => 'approved']
         && $jobs->count() === 1
         && DB::table('governance_grants')->count() === 0
