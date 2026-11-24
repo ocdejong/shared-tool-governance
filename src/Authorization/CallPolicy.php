@@ -146,17 +146,23 @@ final readonly class CallPolicy
     private function eligibility(Scope $scope, ResourceReference $resource, OwnerReference $owner): ?array
     {
         $rule = $this->approvers?->approvalRuleFor($scope, $resource, $owner);
-        $approver = $rule === null ? $this->authority->approverFor($scope, $resource, $owner) : null;
-        $people = $rule === null ? ($approver === null ? [] : [$approver]) : $rule->eligiblePeople;
-        if ($people === [] || in_array('', $people, true)
-            || ($owner->type === OwnerType::PERSON && $people !== [$owner->id])
-            || ! $this->access->allows($scope, $scope, ...$people)) {
+        if ($rule === null) {
+            $approver = $this->authority->approverFor($scope, $resource, $owner);
+            if ($approver === null || $approver === ''
+                || ($owner->type === OwnerType::PERSON && $approver !== $owner->id)
+                || ! $this->access->allows($scope, $scope, $approver)) {
+                return null;
+            }
+
+            return ['approver_id' => $approver];
+        }
+
+        $people = $rule->eligiblePeople;
+        if ($people === [] || in_array('', $people, true) || ! $this->access->allows($scope, $scope, ...$people)) {
             return null;
         }
 
-        return $rule === null
-            ? ['approver_id' => $people[0]]
-            : ['mode' => $rule->mode->value, 'eligible_people' => $people];
+        return ['mode' => $rule->mode->value, 'eligible_people' => $people];
     }
 
     /** @param array<string, Eligibility> $owners */

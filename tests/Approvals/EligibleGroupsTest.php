@@ -32,18 +32,18 @@ beforeEach(function (): void {
     Queue::fake();
 });
 
-function groupHost(ApprovalRule $rule, bool $withPersonal = false): ApprovalHost
+function groupHost(ApprovalRule $rule, bool $withPersonal = false, ?ApprovalRule $personalRule = null): ApprovalHost
 {
     $host = new ApprovalHost;
     $host->allHouseholdOwned = ! $withPersonal;
     $host->bind();
-    app()->instance(ApproverPolicy::class, new class($rule) implements ApproverPolicy
+    app()->instance(ApproverPolicy::class, new class($rule, $personalRule) implements ApproverPolicy
     {
-        public function __construct(public ApprovalRule $rule) {}
+        public function __construct(private ApprovalRule $rule, private ?ApprovalRule $personalRule) {}
 
         public function approvalRuleFor(Scope $scope, ResourceReference $resource, OwnerReference $owner): ?ApprovalRule
         {
-            return $owner->id === $scope->workspaceId ? $this->rule : null;
+            return $owner->id === $scope->workspaceId ? $this->rule : $this->personalRule;
         }
     });
 
@@ -133,6 +133,23 @@ it('keeps independent requirements separate when their eligible people overlap',
     ApprovalHost::runResumeJobs();
     expect($host->executions)->toHaveCount($groupFirst ? 0 : 1);
 })->with([false, true]);
+
+it('requires two different people when the host explicitly gives two owners overlapping any groups', function (): void {
+    $rule = new ApprovalRule(ApprovalMode::ANY, ['alice', 'bob']);
+    $host = groupHost($rule, withPersonal: true, personalRule: $rule);
+    app(Authorizer::class)->authorize($host->call(two: true));
+    ApprovalHost::deliverCards();
+
+    $scope = $host->context->scope;
+    [$alicePersonal, $aliceWorkspace] = $host->inbox->cards($scope, 'alice');
+    [, $bobWorkspace] = $host->inbox->cards($scope, 'bob');
+    expect(groupReply($alicePersonal, $host, 'alice', ApprovalDecision::APPROVE)->accepted)->toBeTrue()
+        ->and(groupReply($aliceWorkspace, $host, 'alice', ApprovalDecision::APPROVE)->status)->toBe('refused')
+        ->and(app(Approvals::class)->receipt('visit'))->toBe(['status' => 'pending_approval'])
+        ->and(groupReply($bobWorkspace, $host, 'bob', ApprovalDecision::APPROVE)->accepted)->toBeTrue();
+    ApprovalHost::runResumeJobs();
+    expect($host->executions)->toHaveCount(1);
+});
 
 it('reports an undeliverable group without staging either requirement', function (ApprovalMode $mode, array $people): void {
     Event::fake([ApprovalUndeliverable::class]);
