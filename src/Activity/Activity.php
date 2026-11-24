@@ -135,7 +135,8 @@ final readonly class Activity
         $receipt['approvals'] = self::decidedApprovals($row, $isRequester ? null : $targets);
 
         if ($isRequester) {
-            $reason = $row->getAttribute('frozen_inputs')['reason'] ?? null;
+            $inputs = $row->getAttribute('frozen_inputs');
+            $reason = $inputs === null ? null : ($inputs['reason'] ?? $row->getRawOriginal('reason'));
 
             return is_string($reason) ? $receipt + ['reason' => $reason] : $receipt;
         }

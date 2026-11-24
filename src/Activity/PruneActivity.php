@@ -53,7 +53,11 @@ final class PruneActivity
             GovernanceOutboxMessage::query()->where('invocation_row_id', $rowId)->update(['payload' => null]);
         }
 
-        $row->forceFill(['receipt_targets' => ReceiptTargets::read($row), 'frozen_inputs' => null])->save();
+        $changes = ['receipt_targets' => ReceiptTargets::read($row), 'frozen_inputs' => null];
+        if ($row->getRawOriginal('reason') !== null) {
+            $changes['reason'] = null;
+        }
+        $row->forceFill($changes)->save();
 
         return true;
     }

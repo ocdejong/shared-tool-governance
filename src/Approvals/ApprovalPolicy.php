@@ -24,7 +24,7 @@ final readonly class ApprovalPolicy
     {
         $scope = ApprovalStore::scope($row);
         $inputs = $row->getAttribute('frozen_inputs');
-        $reason = $inputs['reason'] ?? null;
+        $reason = $inputs['reason'] ?? $row->getRawOriginal('reason');
         if (! is_string($reason) || ! isset($inputs['arguments_json'], $inputs['approval_requirements'])) {
             return null;
         }

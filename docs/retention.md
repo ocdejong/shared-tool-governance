@@ -7,9 +7,17 @@ Use `Ocdejong\SharedToolGovernance\Activity\Activity` from authenticated host co
 
 An unexpired, unredeemed grant reads as `granted` without an outcome. An expired unused grant reads as `approved_unused`. Once a grant is redeemed, its outcome is `unknown` until the executor records a known result. Reconcile uncertain results through the host before attempting the operation again.
 
-## Pruning
+## Upgrading a live installation
 
-The package migration moves existing reasons into encrypted frozen inputs and discards reasons for calls already pruned. Rolling back restores retained reasons to a nullable plaintext column.
+Fresh installations can run the full migration set. For an existing installation with active governance traffic, apply the changes in this order.
+
+1. Run the nullable-column migration using the new package files while the previous application still serves traffic. From the Laravel application, run `php artisan migrate --path=vendor/ocdejong/shared-tool-governance/database/migrations/2026_11_24_000002_allow_encrypted_invocation_reasons.php`.
+2. Hand governance requests and approval queues to the new application and workers together. Keep pending jobs in the queue for the new workers. The new code can resume calls from either storage format. Start using its authorizer once the previous workers have stopped consuming, since those workers can only resume calls with a plaintext reason.
+3. Run `php artisan migrate` once the previous application and workers have stopped using governance. The remaining migration copies retained reasons into encrypted frozen inputs and drops the legacy column. Reasons on already-pruned calls are discarded.
+
+Rolling back the drop restores retained reasons to a nullable plaintext column, including reasons for calls that are still pending. Already-pruned reasons stay deleted. The new runtime continues to work with the restored schema. If you also roll back the application, keep approval processing on compatible workers until the older runtime takes over authorization and any calls created during the rollback have a restored reason or have reached a terminal state.
+
+## Pruning
 
 The Laravel scheduler runs `php artisan shared-tool-governance:prune` daily when the host runs `schedule:run` or `schedule:work`. You can also run the command manually.
 
