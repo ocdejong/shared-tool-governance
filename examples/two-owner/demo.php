@@ -11,12 +11,11 @@ use Illuminate\Support\Facades\Http;
 use Ocdejong\SharedToolGovernance\Activity\Activity;
 use Ocdejong\SharedToolGovernance\Approvals\ApprovalDecision;
 use Ocdejong\SharedToolGovernance\Approvals\Approvals;
-use Ocdejong\SharedToolGovernance\Authorization\Authorizer;
-use Ocdejong\SharedToolGovernance\Data\Invocation;
 use Ocdejong\SharedToolGovernance\Data\Verdict;
 use Ocdejong\SharedToolGovernance\Data\VerifiedReply;
 use Ocdejong\SharedToolGovernance\Discovery\DiscoveryMode;
 use Ocdejong\SharedToolGovernance\Discovery\ToolDiscovery;
+use Ocdejong\SharedToolGovernance\Governance;
 use Ocdejong\SharedToolGovernance\LocalInbox\LocalInbox;
 use Ocdejong\SharedToolGovernance\Tools\ToolRegistry;
 
@@ -116,24 +115,15 @@ function runDemo(string $phase): void
     check($schema['required'] === ['date'] && array_keys($schema['properties']) === ['date']
         && ($schema['additionalProperties'] ?? null) === false, 'The tool schema must accept only the date. The reason belongs to the invocation.');
     $arguments = ['date' => $schema['properties']['date']['const']];
-    $request = new Invocation(
-        $callId,
-        $definition->name,
-        $definition->version,
-        $arguments,
-        REASON,
-        $context,
-        $definition->executorId,
-    );
     $cache->put('demo.request-context', [
-        'id' => $request->id,
+        'id' => $callId,
         'requester' => $context->requesterId,
         'runtime' => $context->runtimeId,
     ]);
-    $result = app(Authorizer::class)->authorize($request);
-    check($result->jsonSerialize() === ['status' => 'pending_approval', 'request_id' => $callId]
-        && $result->grantToken() === null, 'Expected an audience-safe pending response without a grant.');
-    show('Model status', $result->jsonSerialize());
+    $result = app(Governance::class)->call($callId, $definition->name, $definition->version, $arguments, REASON);
+    check($result === ['status' => 'pending_approval', 'call_id' => $callId, 'result' => null],
+        'Expected an audience-safe pending response.');
+    show('Model status', $result);
 
     check($jobs->count() === 1, 'Expected one queued card delivery.');
     check(Artisan::call('queue:work', ['--once' => true, '--queue' => 'default', '--tries' => 1]) === 0, 'Card delivery worker failed.');

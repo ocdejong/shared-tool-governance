@@ -4,10 +4,13 @@ declare(strict_types=1);
 
 namespace Ocdejong\SharedToolGovernance\Tools;
 
+use Generator;
 use InvalidArgumentException;
+use IteratorAggregate;
 use Ocdejong\SharedToolGovernance\Data\ToolDefinition;
 
-final class ToolRegistry
+/** @implements IteratorAggregate<int, ToolDefinition> */
+final class ToolRegistry implements IteratorAggregate
 {
     /** @var array<string, array<string, ToolDefinition>> */
     private array $tools = [];
@@ -24,5 +27,15 @@ final class ToolRegistry
     public function get(string $name, string $version): ToolDefinition
     {
         return $this->tools[$name][$version] ?? throw new InvalidArgumentException('Unknown tool name or version.');
+    }
+
+    /** @return Generator<int, ToolDefinition> */
+    public function getIterator(): Generator
+    {
+        foreach ($this->tools as $versions) {
+            foreach ($versions as $definition) {
+                yield $definition;
+            }
+        }
     }
 }

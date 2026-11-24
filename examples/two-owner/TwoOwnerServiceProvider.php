@@ -52,22 +52,17 @@ final class TwoOwnerServiceProvider extends ServiceProvider implements ResourceA
         $this->app->singleton(LocalInbox::class);
         $this->app->alias(LocalInbox::class, ApprovalNotifier::class);
 
-        $tools = [
-            $this->calendarTool(self::AVAILABILITY, 'calendar.availability', 'Suggest common times'),
-            $this->calendarTool('event_details', 'calendar.details', 'Read event details'),
-        ];
-        $registry = new ToolRegistry;
-        foreach ($tools as $tool) {
-            $registry->register($tool);
-        }
-        $this->app->instance(ToolRegistry::class, $registry);
         $this->app->bind(ToolDiscovery::class, fn () => new ToolDiscovery(
-            $this, $this, app(RuleEvaluator::class), $tools, static fn () => DiscoveryAccess::VISIBLE,
+            $this, $this, app(RuleEvaluator::class), app(ToolRegistry::class), static fn () => DiscoveryAccess::VISIBLE,
         ));
     }
 
     public function boot(): void
     {
+        $registry = app(ToolRegistry::class);
+        $registry->register($this->calendarTool(self::AVAILABILITY, 'calendar.availability', 'Suggest common times'));
+        $registry->register($this->calendarTool('event_details', 'calendar.details', 'Read event details'));
+
         Http::preventStrayRequests();
     }
 
