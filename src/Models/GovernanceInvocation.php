@@ -21,6 +21,7 @@ final class GovernanceInvocation extends Model
             'receipt_targets' => 'encrypted:array',
             'outcome' => ExecutionStatus::class,
             'outcome_recorded_at' => 'immutable_datetime',
+            'approval_expires_at' => 'immutable_datetime',
         ];
     }
 }

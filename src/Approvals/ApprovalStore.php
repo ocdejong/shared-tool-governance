@@ -93,7 +93,8 @@ final class ApprovalStore
 
     public static function expiresAt(GovernanceInvocation $row): CarbonInterface
     {
-        return $row->getAttribute('created_at')->copy()->addMinutes(self::LIFETIME_MINUTES);
+        return $row->getAttribute('approval_expires_at')
+            ?? $row->getAttribute('created_at')->copy()->addMinutes(self::LIFETIME_MINUTES);
     }
 
     public static function move(GovernanceInvocation $row, string $status): void

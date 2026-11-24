@@ -53,6 +53,7 @@ final readonly class Authorizer
         $requirements = $status === 'pending_approval' ? $this->policy->approvalRequirements($frozen, $decisions) : null;
         $call = $frozen->call;
         $context = $call->context;
+        $issuedAt = now();
         $row = GovernanceInvocation::query()->forceCreate([
             'host_scope' => $context->scope->hostScope,
             'household_id' => $context->scope->householdId,
@@ -71,6 +72,11 @@ final readonly class Authorizer
             ],
             'fingerprint' => $fingerprint,
             'status' => $status,
+            'created_at' => $issuedAt,
+            'updated_at' => $issuedAt,
+            'approval_expires_at' => $status === 'pending_approval'
+                ? $issuedAt->copy()->addMinutes(config()->integer('shared-tool-governance.approval_lifetime_minutes'))
+                : null,
         ]);
         $token = $status === 'granted' ? GrantService::issue($row) : null;
         InvocationStore::audit($row, $status);

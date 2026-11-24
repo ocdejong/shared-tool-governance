@@ -30,12 +30,18 @@ final class ApprovalWork
     /** Requeue committed work after lost wakeups, missed deliveries or worker restarts. */
     public function recover(): void
     {
-        $cutoff = (new GovernanceInvocation)->fromDateTime(now()->subMinutes(ApprovalStore::LIFETIME_MINUTES));
+        $model = new GovernanceInvocation;
+        $now = now();
+        $deadline = $model->fromDateTime($now);
+        $legacyCutoff = $model->fromDateTime($now->copy()->subMinutes(ApprovalStore::LIFETIME_MINUTES));
 
         DB::table('governance_invocations')->useWritePdo()
-            ->where(function ($query) use ($cutoff): void {
+            ->where(function ($query) use ($deadline, $legacyCutoff): void {
                 $query->where('status', 'approved')
-                    ->orWhere(fn ($pending) => $pending->where('status', 'pending_approval')->where('created_at', '<=', $cutoff))
+                    ->orWhere(fn ($pending) => $pending->where('status', 'pending_approval')
+                        ->where(fn ($due) => $due->where('approval_expires_at', '<=', $deadline)
+                            ->orWhere(fn ($legacy) => $legacy->whereNull('approval_expires_at')
+                                ->where('created_at', '<=', $legacyCutoff))))
                     ->orWhere(fn ($granted) => $granted->where('status', 'granted')
                         ->whereExists(fn ($approvals) => $approvals->from('governance_approvals')
                             ->whereColumn('invocation_row_id', 'governance_invocations.id'))

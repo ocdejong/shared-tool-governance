@@ -99,8 +99,10 @@ it('upgrades pre-change reasons, preserves pending approval and restores only re
     approveMigrationCard($host, $legacyCard);
     expect(app(Approvals::class)->receipt('legacy-window'))->toBe(['status' => 'granted', 'outcome' => 'success']);
 
+    // Install the deadline column so the current authorizer can run before the reason data migration.
     expect(Artisan::call('migrate', ['--realpath' => true, '--path' => [
         $directory.'/2026_11_24_000002_allow_encrypted_invocation_reasons.php',
+        $directory.'/2026_11_24_000004_add_approval_deadline_to_governance_invocations.php',
     ]]))->toBe(0, Artisan::output())
         ->and(Schema::hasColumn('governance_invocations', 'reason'))->toBeTrue();
     $activity = app(Activity::class);

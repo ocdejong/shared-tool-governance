@@ -20,6 +20,7 @@ final class GovernanceServiceProvider extends ServiceProvider
 {
     public function register(): void
     {
+        $this->mergeConfigFrom(__DIR__.'/../config/shared-tool-governance.php', 'shared-tool-governance');
         $this->app->bindIf(RuleEvaluator::class, ResourceRules::class);
         $this->app->singletonIf(ToolRegistry::class);
         $this->app->bindIf(ToolDiscovery::class, static fn (Container $app) => new ToolDiscovery(
@@ -32,6 +33,9 @@ final class GovernanceServiceProvider extends ServiceProvider
 
     public function boot(): void
     {
+        $this->publishes([
+            __DIR__.'/../config/shared-tool-governance.php' => $this->app->configPath('shared-tool-governance.php'),
+        ], 'shared-tool-governance-config');
         $this->loadMigrationsFrom(__DIR__.'/../database/migrations');
         $this->commands([PruneGovernanceActivity::class]);
         $this->callAfterResolving(Schedule::class, static function (Schedule $schedule): void {

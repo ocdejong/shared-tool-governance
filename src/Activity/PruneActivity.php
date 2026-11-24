@@ -13,12 +13,10 @@ use Ocdejong\SharedToolGovernance\Models\GovernanceOutboxMessage;
 /** @internal */
 final class PruneActivity
 {
-    private const int RETENTION_DAYS = 30;
-
     public function prune(): int
     {
         $now = now();
-        $cutoff = $now->copy()->subDays(self::RETENTION_DAYS);
+        $cutoff = $now->copy()->subDays(config()->integer('shared-tool-governance.retention_days'));
         $candidates = GovernanceInvocation::query();
         $candidates->where('created_at', '<=', $candidates->getModel()->fromDateTime($cutoff));
         $candidates->getQuery()->whereNotNull('frozen_inputs')->useWritePdo();

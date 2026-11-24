@@ -21,8 +21,6 @@ use SensitiveParameter;
 
 final readonly class GrantService
 {
-    private const int LIFETIME_MINUTES = 5;
-
     public function __construct(
         private CallPolicy $policy,
         private TrustedInvocationContext $context,
@@ -34,10 +32,11 @@ final readonly class GrantService
     {
         $token = bin2hex(random_bytes(32));
         $now = DB::raw(GrantClock::sql());
+        $minutes = config()->integer('shared-tool-governance.grant_lifetime_minutes');
         GovernanceGrant::query()->insert([
             'invocation_row_id' => $invocation->getKey(),
             'token_hash' => hash('sha256', $token),
-            'expires_at' => DB::raw(GrantClock::sql(self::LIFETIME_MINUTES)),
+            'expires_at' => DB::raw(GrantClock::sql($minutes)),
             'created_at' => $now,
             'updated_at' => $now,
         ]);

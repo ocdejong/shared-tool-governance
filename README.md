@@ -25,6 +25,21 @@ Laravel discovers the service provider and its migrations automatically. The mig
 
 Follow the [host integration guide](docs/integration.md) to register tools, connect private approvals and run the queue worker. The [two-owner example](examples/two-owner) shows those bindings in a Laravel service provider.
 
+## Optional configuration
+
+The package uses your application's database, queue, scheduler and encryption key. To override the default durations, publish the config and edit `config/shared-tool-governance.php`.
+
+```sh
+php artisan vendor:publish --tag=shared-tool-governance-config
+php artisan config:cache
+```
+
+- `grant_lifetime_minutes` defaults to 5.
+- `approval_lifetime_minutes` defaults to 15.
+- `retention_days` defaults to 30 and controls how long private inputs are retained after a call reaches a terminal state.
+
+Changing the lifetimes only affects newly issued grants and approval requests. Register tool callbacks in PHP through the host's service provider so Laravel can cache the config.
+
 ## Smoke-test a clean consumer
 
 From a Git checkout of this repository, run `bin/consumer-smoke` to test `HEAD`, or pass a commit with `bin/consumer-smoke <commit>`. You need Bash, Git, Composer, PHP with PDO SQLite and Composer access to Laravel's dependencies. The checkout must contain the seam commit `b4ceea1`.
