@@ -30,6 +30,7 @@ final readonly class Approvals
         return $this->respond($approvalId, $decision, $reply)->accepted;
     }
 
+    /** Report the card's requirement decision. Use receipt() for the status of the entire call. */
     public function respond(string $approvalId, ApprovalDecision $decision, VerifiedReply $reply): ApprovalResponse
     {
         if ($approvalId === '' || $reply->cardId === '' || $reply->replyId === '') {
@@ -95,11 +96,20 @@ final readonly class Approvals
         $status = match (true) {
             $decision === ApprovalDecision::DECLINE => 'declined',
             ApprovalStore::hasDistinctConsent($row) => 'approved',
+            ! ApprovalStore::hasPossibleCompletion($row) => 'approval_undeliverable',
             default => null,
         };
         if ($status !== null) {
             ApprovalStore::move($row, $status);
-            DB::afterCommit(static fn () => ApprovalWork::resume((int) $row->getKey()));
+            if ($status === 'approval_undeliverable') {
+                event(new ApprovalUndeliverable(
+                    ApprovalStore::scope($row),
+                    $row->getAttribute('invocation_id'),
+                    ApprovalUndeliverable::DISTINCT_COMPLETION_IMPOSSIBLE,
+                ));
+            } else {
+                DB::afterCommit(static fn () => ApprovalWork::resume((int) $row->getKey()));
+            }
         }
 
         $settled = ApprovalStore::settlement($requirement->map(

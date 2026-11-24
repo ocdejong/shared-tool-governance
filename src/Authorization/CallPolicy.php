@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Ocdejong\SharedToolGovernance\Authorization;
 
 use InvalidArgumentException;
+use Ocdejong\SharedToolGovernance\Approvals\ApprovalAssignments;
 use Ocdejong\SharedToolGovernance\Contracts\ApproverPolicy;
 use Ocdejong\SharedToolGovernance\Contracts\ResourceAuthority;
 use Ocdejong\SharedToolGovernance\Contracts\RuleEvaluator;
@@ -22,7 +23,7 @@ use Ocdejong\SharedToolGovernance\Tools\ToolRegistry;
 /**
  * @phpstan-type Decision array{owner_type: string, owner_id: string, verdict: string, rule_key: string|null, rule_revision: int|null}
  * @phpstan-type Eligibility array{approver_id: string}|array{mode: string, eligible_people: list<string>}
- * @phpstan-type Requirement array{owner_type: string, owner_id: string, approver_id: string}|array{owner_type: string, owner_id: string, mode: string, eligible_people: list<string>}
+ * @phpstan-type Requirement array{owner_type: string, owner_id: string, approver_id: string}|array{owner_type: string, owner_id: string, mode: string, eligible_people: list<string>, effective_people?: list<string>}
  */
 final readonly class CallPolicy
 {
@@ -139,7 +140,19 @@ final readonly class CallPolicy
             $requirements[$index] = ['owner_type' => $owner->type->value, 'owner_id' => $owner->id] + $eligibility;
         }
 
-        return self::hasDistinctApprovers($owners) ? $requirements : null;
+        $effective = self::effectivePeople($owners);
+        if ($effective === null) {
+            return null;
+        }
+
+        foreach ($requirements as $index => $requirement) {
+            $key = $requirement['owner_type'].':'.$requirement['owner_id'];
+            if (isset($requirement['eligible_people'], $effective[$key]) && $effective[$key] !== $requirement['eligible_people']) {
+                $requirements[$index]['effective_people'] = $effective[$key];
+            }
+        }
+
+        return $requirements;
     }
 
     /** @return Eligibility|null */
@@ -165,58 +178,37 @@ final readonly class CallPolicy
         return ['mode' => $rule->mode->value, 'eligible_people' => $people];
     }
 
-    /** @param array<string, Eligibility> $owners */
-    private static function hasDistinctApprovers(array $owners): bool
+    /**
+     * @param  array<string, Eligibility>  $owners
+     * @return array<string, list<string>>|null
+     */
+    private static function effectivePeople(array $owners): ?array
     {
-        $choices = [];
-        $assigned = [];
+        $slots = [];
+        $anySlots = [];
         foreach ($owners as $owner => $eligibility) {
             if (($eligibility['mode'] ?? null) === ApprovalMode::ANY->value) {
-                $choices[$owner] = $eligibility['eligible_people'];
+                $anySlots[$owner] = count($slots);
+                $slots[] = $eligibility['eligible_people'];
 
                 continue;
             }
 
             foreach ($eligibility['eligible_people'] ?? [$eligibility['approver_id']] as $person) {
-                if (isset($assigned[$person])) {
-                    return false;
-                }
-
-                $assigned[$person] = $owner;
+                $slots[] = [$person];
             }
         }
 
-        foreach (array_keys($choices) as $owner) {
-            $visited = [];
-            if (! self::assignApprover($owner, $choices, $assigned, $visited)) {
-                return false;
-            }
+        if (! ApprovalAssignments::possible($slots)) {
+            return null;
         }
 
-        return true;
-    }
-
-    /**
-     * @param  array<string, list<string>>  $choices
-     * @param  array<array-key, string>  $assigned
-     * @param  array<array-key, true>  $visited
-     */
-    private static function assignApprover(string $owner, array $choices, array &$assigned, array &$visited): bool
-    {
-        foreach ($choices[$owner] ?? [] as $person) {
-            if (isset($visited[$person])) {
-                continue;
-            }
-
-            $visited[$person] = true;
-            if (! isset($assigned[$person]) || self::assignApprover($assigned[$person], $choices, $assigned, $visited)) {
-                $assigned[$person] = $owner;
-
-                return true;
-            }
+        $effective = [];
+        foreach ($anySlots as $owner => $slot) {
+            $effective[$owner] = ApprovalAssignments::viablePeople($slots, $slot);
         }
 
-        return false;
+        return $effective;
     }
 
     /** @internal */

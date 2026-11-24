@@ -41,7 +41,7 @@ final class ApprovalStore
         }
 
         foreach ($owners as $key => $owner) {
-            foreach ($owner['eligible_people'] ?? [$owner['approver_id']] as $person) {
+            foreach ($owner['effective_people'] ?? $owner['eligible_people'] ?? [$owner['approver_id']] as $person) {
                 $preview = $previewFor($call, $targetsByOwner[$key], $person);
                 if ($preview === null) {
                     throw new ApprovalSetupError($call->id, 'The approval preview callback returned null.');
@@ -114,7 +114,7 @@ final class ApprovalStore
             return false;
         }
 
-        $byOwner = $cards->groupBy(static fn (GovernanceApproval $card): string => $card->getAttribute('owner_type')->value.':'.$card->getAttribute('owner_id'));
+        $byOwner = self::byOwner($cards);
         $checked = [];
         foreach ($requirements as $requirement) {
             $key = $requirement['owner_type'].':'.$requirement['owner_id'];
@@ -123,7 +123,7 @@ final class ApprovalStore
             }
 
             $group = $byOwner->get($key);
-            $people = $requirement['eligible_people'] ?? [$requirement['approver_id']];
+            $people = $requirement['effective_people'] ?? $requirement['eligible_people'] ?? [$requirement['approver_id']];
             if ($group === null || $group->pluck('approver_id')->sort(SORT_STRING)->values()->all() !== $people
                 || $group->contains(static fn (GovernanceApproval $card): bool => $card->getAttribute('approval_mode')?->value !== ($requirement['mode'] ?? null))
                 || self::settlement($group) !== ApprovalDecision::APPROVE) {
@@ -134,6 +134,35 @@ final class ApprovalStore
         }
 
         return count($checked) === $byOwner->count();
+    }
+
+    public static function hasPossibleCompletion(GovernanceInvocation $row): bool
+    {
+        $slots = [];
+        foreach (self::byOwner(self::approvals($row)->get()) as $group) {
+            $people = array_values($group->map(static fn (GovernanceApproval $card): string => $card->approver_id)->all());
+            if ($group->first()?->getAttribute('approval_mode') === ApprovalMode::ANY) {
+                $winner = $group->firstWhere('decision', ApprovalDecision::APPROVE->value);
+                $slots[] = $winner === null ? $people : [$winner->approver_id];
+
+                continue;
+            }
+
+            foreach ($people as $person) {
+                $slots[] = [$person];
+            }
+        }
+
+        return ApprovalAssignments::possible($slots);
+    }
+
+    /**
+     * @param  Collection<int, GovernanceApproval>  $cards
+     * @return Collection<non-falsy-string, Collection<int, GovernanceApproval>>
+     */
+    private static function byOwner(Collection $cards): Collection
+    {
+        return $cards->groupBy(static fn (GovernanceApproval $card): string => $card->getAttribute('owner_type')->value.':'.$card->getAttribute('owner_id'));
     }
 
     public static function scope(GovernanceInvocation $row): Scope
@@ -164,14 +193,14 @@ final class ApprovalStore
     public static function move(GovernanceInvocation $row, string $status): void
     {
         $changes = ['status' => $status];
-        if (in_array($status, ['declined', 'expired', 'revoked', 'approved_unused'], true)) {
+        if (in_array($status, ['declined', 'expired', 'revoked', 'approved_unused', 'approval_undeliverable'], true)) {
             $changes['frozen_inputs'] = self::auditInputs($row);
         }
 
         $row->forceFill($changes)->save();
         InvocationStore::audit($row, $status);
 
-        if (in_array($status, ['declined', 'expired', 'revoked', 'approved_unused', 'granted'], true)) {
+        if (in_array($status, ['declined', 'expired', 'revoked', 'approved_unused', 'approval_undeliverable', 'granted'], true)) {
             self::approvals($row)->update(['preview' => null]);
             GovernanceOutboxMessage::query()->where('invocation_row_id', $row->getKey())->update(['payload' => null]);
         }

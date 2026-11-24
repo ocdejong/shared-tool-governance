@@ -51,6 +51,8 @@ final class ApprovalHost implements ResourceAuthority, ResumptionContext, RuleEv
 
     public bool $allHouseholdOwned = false;
 
+    public bool $includeThirdOwner = false;
+
     /** @var array<string, string> */
     public array $approversByResource = [];
 
@@ -101,6 +103,7 @@ final class ApprovalHost implements ResourceAuthority, ResumptionContext, RuleEv
             resolveTargets: fn (array $arguments): array => [
                 new ResourceReference('item', 'personal', $this->revision),
                 ...($arguments['two'] ? [new ResourceReference('item', 'shared', 'r2')] : []),
+                ...($this->includeThirdOwner ? [new ResourceReference('item', 'third', 'r3')] : []),
             ],
             executorId: $executorId,
             effect: 'Reschedule the selected items',
@@ -177,6 +180,7 @@ final class ApprovalHost implements ResourceAuthority, ResumptionContext, RuleEv
                 ? new OwnerReference(OwnerType::WORKSPACE, $scope->workspaceId)
                 : new OwnerReference(OwnerType::PERSON, $this->personalOwner),
             'shared' => new OwnerReference(OwnerType::WORKSPACE, $scope->workspaceId),
+            'third' => new OwnerReference(OwnerType::PERSON, 'carol'),
             default => null,
         };
     }

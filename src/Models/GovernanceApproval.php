@@ -8,6 +8,7 @@ use Illuminate\Database\Eloquent\Model;
 use Ocdejong\SharedToolGovernance\Data\ApprovalMode;
 use Ocdejong\SharedToolGovernance\Data\OwnerType;
 
+/** @property-read string $approver_id */
 final class GovernanceApproval extends Model
 {
     use WritesTimestampOffsets;

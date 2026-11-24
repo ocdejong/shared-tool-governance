@@ -42,7 +42,7 @@ final readonly class ActivityState
         }
 
         if ($status !== 'granted') {
-            $terminalAt = in_array($status, ['denied', 'declined', 'expired', 'revoked', 'approved_unused'], true)
+            $terminalAt = in_array($status, ['denied', 'declined', 'expired', 'revoked', 'approved_unused', 'approval_undeliverable'], true)
                 ? $row->getAttribute('updated_at') : null;
 
             return new self($status, null, $terminalAt);

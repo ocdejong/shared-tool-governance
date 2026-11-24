@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Queue;
 use Ocdejong\SharedToolGovernance\Approvals\ApprovalDecision;
@@ -17,9 +18,11 @@ use Ocdejong\SharedToolGovernance\Data\OwnerReference;
 use Ocdejong\SharedToolGovernance\Data\ResourceReference;
 use Ocdejong\SharedToolGovernance\Data\Scope;
 use Ocdejong\SharedToolGovernance\Data\VerifiedReply;
+use Ocdejong\SharedToolGovernance\Jobs\ResumeApproval;
 use Ocdejong\SharedToolGovernance\LocalInbox\LocalCard;
 use Ocdejong\SharedToolGovernance\Models\GovernanceApproval;
 use Ocdejong\SharedToolGovernance\Models\GovernanceGrant;
+use Ocdejong\SharedToolGovernance\Models\GovernanceInvocation;
 use Ocdejong\SharedToolGovernance\Models\GovernanceOutboxMessage;
 use Ocdejong\SharedToolGovernance\Tests\Approvals\ApprovalHost;
 
@@ -90,6 +93,7 @@ it('settles an any requirement with the first eligible reply and returns the rec
     ['alice', 'bob', ApprovalDecision::APPROVE],
     ['bob', 'alice', ApprovalDecision::APPROVE],
     ['bob', 'alice', ApprovalDecision::DECLINE],
+    ['alice', 'bob', ApprovalDecision::DECLINE],
 ]);
 
 it('records an all vote until every eligible person approves or one declines', function (ApprovalDecision $decision): void {
@@ -114,25 +118,98 @@ it('records an all vote until every eligible person approves or one declines', f
     expect($host->executions)->toHaveCount((int) ($decision === ApprovalDecision::APPROVE));
 })->with(ApprovalDecision::cases());
 
-it('keeps independent requirements separate when their eligible people overlap', function (bool $groupFirst): void {
+it('stages only viable distinct cards for forced assignments and accepts replies in either order', function (bool $groupFirst, ApprovalDecision $firstDecision): void {
     $host = groupHost(new ApprovalRule(ApprovalMode::ANY, ['alice', 'bob']), withPersonal: true);
     app(Authorizer::class)->authorize($host->call(two: true));
     ApprovalHost::deliverCards();
     $scope = $host->context->scope;
-    [$personal, $group] = $host->inbox->cards($scope, 'alice');
-    $bob = $host->inbox->cards($scope, 'bob')[0];
-    expect($personal->message)->toContain('personal')->not->toContain('shared')
-        ->and($group->message)->toContain('shared')->not->toContain('personal');
+    $alice = $host->inbox->cards($scope, 'alice');
+    $bob = $host->inbox->cards($scope, 'bob');
+    expect($alice)->toHaveCount(1)->and($bob)->toHaveCount(1)
+        ->and($alice[0]->message)->toContain('personal')->not->toContain('shared')
+        ->and($bob[0]->message)->toContain('shared')->not->toContain('personal');
+    $requirements = GovernanceInvocation::query()->sole()->getAttribute('frozen_inputs')['approval_requirements'];
+    expect($requirements[1]['eligible_people'])->toBe(['alice', 'bob'])
+        ->and($requirements[1]['effective_people'])->toBe(['bob']);
 
-    expect(groupReply($groupFirst ? $group : $personal, $host, 'alice', ApprovalDecision::APPROVE)->accepted)->toBeTrue()
-        ->and(groupReply($groupFirst ? $personal : $group, $host, 'alice', ApprovalDecision::APPROVE)->status)->toBe('refused')
-        ->and(app(Approvals::class)->receipt('visit'))->toBe(['status' => 'pending_approval'])
-        ->and(GovernanceApproval::query()->whereNotNull('decision')->count())->toBe(1);
+    [$first, $second] = $groupFirst ? [$bob[0], $alice[0]] : [$alice[0], $bob[0]];
+    [$firstPerson, $secondPerson] = $groupFirst ? ['bob', 'alice'] : ['alice', 'bob'];
+    expect(groupReply($bob[0], $host, 'alice', ApprovalDecision::APPROVE)->status)->toBe('refused');
+    $reply = groupReply($first, $host, $firstPerson, $firstDecision);
+    expect($reply->status)->toBe('settled')->and($reply->accepted)->toBeTrue()->and($reply->decision)->toBe($firstDecision)
+        ->and(GovernanceApproval::query()->whereNotNull('decision')->count())->toBe(1)
+        ->and(GovernanceGrant::query()->count())->toBe(0);
 
-    expect(groupReply($bob, $host, 'bob', ApprovalDecision::APPROVE)->accepted)->toBe(! $groupFirst);
+    $approved = $firstDecision === ApprovalDecision::APPROVE;
+    expect(app(Approvals::class)->receipt('visit'))->toBe(['status' => $approved ? 'pending_approval' : 'declined'])
+        ->and(groupReply($second, $host, $secondPerson, ApprovalDecision::APPROVE)->accepted)->toBe($approved);
+    $late = groupReply($first, $host, $firstPerson, $approved ? ApprovalDecision::DECLINE : ApprovalDecision::APPROVE);
+    expect($late->status)->toBe('settled')->and($late->accepted)->toBeFalse()->and($late->decision)->toBe($firstDecision);
+
     ApprovalHost::runResumeJobs();
-    expect($host->executions)->toHaveCount($groupFirst ? 0 : 1);
-})->with([false, true]);
+    expect($host->executions)->toHaveCount((int) $approved)
+        ->and(GovernanceGrant::query()->count())->toBe((int) $approved);
+})->with([false, true])->with(ApprovalDecision::cases());
+
+it('records an eligible decision that exhausts an ambiguous assignment and closes the call', function (ApprovalDecision $decision): void {
+    Event::fake([ApprovalUndeliverable::class]);
+    $host = new ApprovalHost;
+    $host->includeThirdOwner = true;
+    $host->members[] = 'carol';
+    $host->bind();
+    app()->instance(ApproverPolicy::class, new class implements ApproverPolicy
+    {
+        public function approvalRuleFor(Scope $scope, ResourceReference $resource, OwnerReference $owner): ApprovalRule
+        {
+            $people = match ($resource->id) {
+                'personal' => ['alice', 'bob'],
+                'shared' => ['bob', 'carol'],
+                'third' => ['alice', 'carol'],
+                default => throw new LogicException('Unexpected target'),
+            };
+
+            return new ApprovalRule(ApprovalMode::ANY, $people);
+        }
+    });
+    app(Authorizer::class)->authorize($host->call(two: true));
+    ApprovalHost::deliverCards();
+    $scope = $host->context->scope;
+    [$alicePersonal, $aliceThird] = $host->inbox->cards($scope, 'alice');
+    [, $bobShared] = $host->inbox->cards($scope, 'bob');
+    [$carolShared, $carolThird] = $host->inbox->cards($scope, 'carol');
+
+    expect(groupReply($alicePersonal, $host, 'alice', ApprovalDecision::APPROVE)->accepted)->toBeTrue()
+        ->and(app(Approvals::class)->receipt('visit'))->toBe(['status' => 'pending_approval']);
+    $accepted = DB::transaction(function () use ($carolShared, $host, $decision): ApprovalResponse {
+        $reply = groupReply($carolShared, $host, 'carol', $decision);
+        Event::assertNotDispatched(ApprovalUndeliverable::class);
+
+        return $reply;
+    });
+    $unreachable = $decision === ApprovalDecision::APPROVE;
+    expect($accepted->status)->toBe('settled')->and($accepted->decision)->toBe($decision)->and($accepted->accepted)->toBeTrue()
+        ->and(app(Approvals::class)->receipt('visit'))->toBe(['status' => $unreachable ? 'approval_undeliverable' : 'declined']);
+    $late = groupReply($bobShared, $host, 'bob', ApprovalDecision::APPROVE);
+    expect($late->status)->toBe('settled')->and($late->decision)->toBe($decision)->and($late->accepted)->toBeFalse()
+        ->and(groupReply($aliceThird, $host, 'alice', ApprovalDecision::APPROVE)->status)->toBe('refused')
+        ->and(groupReply($carolThird, $host, 'carol', ApprovalDecision::APPROVE)->status)->toBe('refused');
+
+    if ($unreachable) {
+        Event::assertDispatched(ApprovalUndeliverable::class, fn (ApprovalUndeliverable $event): bool => $event->scope->equals($scope) && $event->invocationId === 'visit' && $event->reason === 'distinct_completion_impossible');
+        expect(groupReply($carolShared, $host, 'carol', $decision)->accepted)->toBeTrue()
+            ->and(app(Authorizer::class)->authorize($host->call(two: true))->status)->toBe('approval_undeliverable');
+        Event::assertDispatchedTimes(ApprovalUndeliverable::class, 1);
+        Queue::assertNotPushed(ResumeApproval::class);
+    } else {
+        Event::assertNotDispatched(ApprovalUndeliverable::class);
+    }
+
+    ApprovalHost::runResumeJobs();
+    expect($host->executions)->toBe([])
+        ->and(GovernanceGrant::query()->count())->toBe(0)
+        ->and(GovernanceApproval::query()->whereNotNull('decision')->count())->toBe(2)
+        ->and(GovernanceApproval::query()->whereNotNull('preview')->count())->toBe(0);
+})->with(ApprovalDecision::cases());
 
 it('requires two different people when the host explicitly gives two owners overlapping any groups', function (): void {
     $rule = new ApprovalRule(ApprovalMode::ANY, ['alice', 'bob']);
