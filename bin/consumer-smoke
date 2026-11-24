@@ -48,7 +48,7 @@ use Ocdejong\SharedToolGovernance\GovernanceServiceProvider;
 
 require 'vendor/autoload.php';
 
-$app = require 'bootstrap/app.php';
+$app = require getcwd().'/bootstrap/app.php';
 $app->make(Kernel::class)->bootstrap();
 
 function check(bool $condition, string $message): void
@@ -61,7 +61,8 @@ function check(bool $condition, string $message): void
 
 check(config('queue.default') === 'database', 'Expected the database queue.');
 
-$mode = $argv[1];
+$mode = $_SERVER['argv'][1];
+$snapshotPath = getenv('DB_DATABASE').'.tables';
 
 if ($mode === 'seed-host') {
     DB::table('users')->insert(['id' => 1, 'name' => 'Smoke Host', 'email' => 'host@example.test', 'password' => 'unused']);
@@ -74,14 +75,22 @@ if ($mode === 'seed-host') {
         'created_at' => 1,
     ]);
 
-    file_put_contents(getenv('DB_DATABASE').'.tables', json_encode(DB::getSchemaBuilder()->getTableListing(), JSON_THROW_ON_ERROR));
+    check(
+        file_put_contents($snapshotPath, json_encode(DB::getSchemaBuilder()->getTableListing(), JSON_THROW_ON_ERROR)) !== false,
+        'Could not save the host table list.',
+    );
     exit(0);
 }
 
 check(DB::table('users')->where('id', 1)->value('email') === 'host@example.test', 'Host user row changed.');
 check(DB::table('jobs')->where('id', 1)->value('payload') === '{}', 'Host queue row changed.');
 
-$hostTables = json_decode(file_get_contents(getenv('DB_DATABASE').'.tables'), true, flags: JSON_THROW_ON_ERROR);
+$snapshot = file_get_contents($snapshotPath);
+if ($snapshot === false) {
+    throw new RuntimeException('Could not read the host table list.');
+}
+
+$hostTables = json_decode($snapshot, true, flags: JSON_THROW_ON_ERROR);
 $tables = DB::getSchemaBuilder()->getTableListing();
 check(array_diff($hostTables, $tables) === [], 'A host table is missing.');
 
@@ -92,7 +101,7 @@ if ($mode === 'rolled-back') {
 
 check($app->getProvider(GovernanceServiceProvider::class) !== null, 'Governance provider was not auto-discovered.');
 check(
-    InstalledVersions::getPrettyVersion('ocdejong/shared-tool-governance') === $argv[2],
+    InstalledVersions::getPrettyVersion('ocdejong/shared-tool-governance') === $_SERVER['argv'][2],
     'Composer did not install the requested governance package revision.',
 );
 
