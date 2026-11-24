@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if (( $# > 1 )); then
-    echo 'Usage: bin/consumer-smoke [commit]' >&2
+demo=false
+if [[ ${1:-} == --demo ]]; then
+    demo=true
+    shift
+fi
+
+if (( $# > 1 )) || [[ ${1:-} == --* ]]; then
+    echo 'Usage: bin/consumer-smoke [--demo] [commit]' >&2
     exit 2
 fi
 
@@ -160,6 +166,22 @@ echo "Installing target $target into the existing host database"
 install_package target
 artisan migrate --force
 check_database installed "$package_version"
+if "$demo"; then
+    example="$scratch/target/examples/two-owner"
+    cp "$example/TwoOwnerServiceProvider.php" app/Providers/
+    in_consumer php -r '
+        $path = "bootstrap/providers.php";
+        $providers = require $path;
+        $providers[] = App\Providers\TwoOwnerServiceProvider::class;
+        if (file_put_contents($path, "<?php\n\nreturn ".var_export($providers, true).";\n") === false) {
+            exit(1);
+        }
+    '
+    demo_key=$(in_consumer php -r 'echo "base64:".base64_encode(random_bytes(32));')
+    in_consumer env APP_KEY="$demo_key" php "$example/demo.php" prepare
+    in_consumer env APP_KEY="$demo_key" php artisan queue:work --once --queue=default --tries=1
+    in_consumer env APP_KEY="$demo_key" php "$example/demo.php" verify
+fi
 artisan migrate:rollback --force
 check_database rolled-back
 
