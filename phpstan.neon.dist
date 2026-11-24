@@ -6,6 +6,7 @@ parameters:
     phpVersion: 80300
     scanFiles:
         - examples/two-owner/TwoOwnerServiceProvider.php
+        - examples/permission-tree/PermissionTreeServiceProvider.php
     paths:
         - src
         - database/migrations
