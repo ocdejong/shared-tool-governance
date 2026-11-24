@@ -9,7 +9,7 @@ use Ocdejong\SharedToolGovernance\Data\Verdict;
 
 final readonly class RuleSettings
 {
-    /** @param array<string, Verdict> $rules */
+    /** @param array<array-key, Verdict> $rules */
     public function __construct(
         public int $revision,
         public bool $enabled,

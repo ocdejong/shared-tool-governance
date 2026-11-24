@@ -1,6 +1,6 @@
 # Editable permissions
 
-`Rules\PermissionTree` supplies the settings data for one resource. Laravel resolves it from the container using the shared `ToolRegistry` and `ResourceRules`. The host supplies the authenticated context, resource selection, routes, labels and controls. There is no separate settings catalog.
+`Rules\PermissionTree` supplies the settings data for one resource. Laravel resolves it from the container using the shared `ToolRegistry`, `ResourceRules` and configured `RuleEvaluator`. The host supplies the authenticated context, resource selection, routes, labels and controls. There is no separate settings catalog.
 
 ## Register once
 
@@ -29,6 +29,8 @@ The tree generates `calendar`, `calendar.events` and `calendar.events.reschedule
 
 Keys remain literal and unchanged in storage. The tree includes all registered permissions, evaluated for the selected resource. It does not call `resolveTargets` or infer applicability from resource types, since targets can depend on invocation arguments. Stored rules for tools no longer registered remain in storage and are preserved by edits. They are absent from the tree until a registration uses their key or a descendant again.
 
+Numeric paths are supported too. Registering `365.calendar` generates the editable parent `365`. The root `0` is also valid. PHP can convert numeric dictionary keys to integers, so the package restores strings before processing paths and stores overrides as a JSON object. Node `key` and matched `sourceKey` values remain literal strings in JSON. Existing stored keys keep their meaning and inheritance.
+
 ## Read the tree
 
 ```php
@@ -43,22 +45,40 @@ $snapshot = $permissions->read($scope, $resource);
 return response()->json($snapshot);
 ```
 
-`PermissionTreeSnapshot` exposes `revision`, `enabled` and a nested list of `nodes`. Nodes and tool references sort by key and by name/version respectively. A `PermissionNode` exposes:
+`PermissionTreeSnapshot` exposes the saved settings' `revision`, `enabled` flag and a nested list of `nodes`. A custom policy's own revision does not replace the saved revision used for optimistic editing. Nodes sort by literal string key, and tool references sort by name/version. A `PermissionNode` exposes:
 
 | Field | Meaning |
 | --- | --- |
 | `key` | Full dotted permission key, also used when saving. |
 | `explicitSetting` | `Verdict::ALLOW`, `DELEGATE`, `DENY`, or `null` for Use parent. |
-| `effectiveVerdict` | The result of `RuleSettings::evaluate(key)`. |
-| `source` | `PermissionSource::EXPLICIT`, `INHERITED`, `DEFAULT_DENY`, or `RESOURCE_OFF`. |
-| `sourceKey` | The evaluator's matched rule key, or `null` for default deny and resource off. |
+| `effectiveVerdict` | The verdict from the active `RuleEvaluator` for this scope, resource, verified owner and action key. |
+| `source` | `PermissionSource::EXPLICIT`, `INHERITED`, `DEFAULT_DENY`, `RESOURCE_OFF`, or `HOST_POLICY`. |
+| `sourceKey` | The active evaluator's matched rule key, or `null` when it supplies none. |
 | `explanation` | The evaluator's explanation. |
 | `tools` | List of `{name, version}` registrations at this key. Empty for generated groups. |
 | `children` | Nested `PermissionNode` values. |
 
-These public readonly values serialize directly to JSON. Backed enums serialize as strings: `ALLOW`, `DELEGATE`, `DENY`, and `explicit`, `inherited`, `default_deny`, `resource_off`.
+These public readonly values serialize directly to JSON. Backed enums serialize as strings: `ALLOW`, `DELEGATE`, `DENY`, and `explicit`, `inherited`, `default_deny`, `resource_off`, `host_policy`.
 
-The host can display `DELEGATE` as "Ask me" and `null` as "Use parent". For example, Reschedule can have `explicitSetting: null`, `effectiveVerdict: DELEGATE`, `source: inherited`, and `sourceKey: calendar`. Render that as "Inherit → Ask me, from Calendar". Default deny has no matching rule. Resource off overrides every rule while retaining each node's explicit setting, so turning access back on restores those settings.
+The host can display `DELEGATE` as "Ask me" and `null` as "Use parent". For example, Reschedule can have `explicitSetting: null`, `effectiveVerdict: DELEGATE`, `source: inherited`, and `sourceKey: calendar`. Render that as "Inherit → Ask me, from Calendar". With the built-in evaluator, default deny has no matching rule. Resource off overrides every rule while retaining each node's explicit setting, so turning access back on restores those settings.
+
+## Saved settings and effective policy
+
+`ResourceRules` owns management authorization, stored overrides, the enabled flag and revision checks. The `RuleEvaluator` bound in Laravel owns the effective verdict, explanation and matched key. Both `read()` and the snapshot returned by `update()` use that policy for the same verified owner, scope, resource and action that dispatch evaluates. Reading settings does not authorize an invocation, issue a grant or execute a tool.
+
+For example, a host can bind its own evaluator in a service provider:
+
+```php
+use Ocdejong\SharedToolGovernance\Contracts\RuleEvaluator;
+
+$this->app->bind(RuleEvaluator::class, CalendarPolicy::class);
+```
+
+`CalendarPolicy` implements the existing `RuleEvaluator` contract. If Pauline saves Allow for Reschedule but the host policy returns Deny, the node shows `explicitSetting: ALLOW` and `effectiveVerdict: DENY` with the host's explanation. A custom evaluator can also allow an action without naming a matched rule. Either verdict with a null matched key has source `host_policy`; a missing key alone does not mean default deny. A matched key equal to the node gives source `explicit`, and a different matched key gives `inherited`.
+
+The saved enabled flag remains visible with a custom evaluator. That evaluator decides how saved settings, including the off switch, affect its verdict, just as it does during dispatch. The tree does not override the host result or infer `resource_off` from the saved flag. Implement custom evaluators as policy reads and propagate failures so an edit can roll back.
+
+The built-in `ResourceRules` evaluator evaluates the single settings snapshot already loaded or saved by the operation. It preserves the `explicit`, `inherited`, `default_deny` and `resource_off` sources without loading settings again for each node.
 
 ## Save an override
 
@@ -77,11 +97,11 @@ $snapshot = $permissions->update($scope, $resource, $snapshot->revision, [
 ]);
 ```
 
-`update()` accepts the same patch as `ResourceRules::setRules()`: optional `rules` and optional `enabled`. Omitted keys stay unchanged, including explicit child overrides when a parent changes. Clearing a root rule falls back to default deny. To switch the resource off, send `['enabled' => false]` with the latest revision.
+`update()` accepts the same patch as `ResourceRules::setRules()`: optional `rules` and optional `enabled`. Omitted keys stay unchanged, including explicit child overrides when a parent changes. With the built-in policy, clearing a root rule falls back to default deny. To switch the resource off, send `['enabled' => false]` with the latest revision.
 
-Both methods use `ResourceRules` management authorization. They reject another person's personal resource, an unauthorized manager, a mismatched owner binding, or a scope outside the authenticated workspace. A new resource starts at revision zero. Each successful edit advances the resource revision, shared by every node and the off switch. A stale revision raises `StaleRuleRevision` and saves nothing. The returned snapshot describes the revision just saved; another editor can subsequently create a newer revision.
+Both methods use `ResourceRules` management authorization, including when a custom evaluator allows access. They reject another person's personal resource, an unauthorized manager, a mismatched owner binding, or a scope outside the authenticated workspace. A new resource starts at revision zero. Each successful edit advances the resource revision once, shared by every node and the off switch. A stale revision raises `StaleRuleRevision` and saves nothing. The edit and its returned snapshot share a transaction: if validation, policy evaluation or snapshot construction fails, the previous settings and revision remain intact. The returned snapshot describes the revision just saved; another editor can subsequently create a newer revision.
 
-In an HTTP host, validate input and convert verdict strings to `Verdict` values before calling `update()`. Map `RuleAccessDenied` to HTTP 403 and `StaleRuleRevision` to HTTP 409, then reload the tree. The package supplies no routes or frontend. This interface uses the package's default `ResourceRules` evaluator; hosts replacing `RuleEvaluator` must also provide a settings view consistent with their replacement policy.
+In an HTTP host, validate input and convert verdict strings to `Verdict` values before calling `update()`. Map `RuleAccessDenied` to HTTP 403 and `StaleRuleRevision` to HTTP 409, then reload the tree. The package supplies no routes or frontend. Hosts replacing `RuleEvaluator` can use the same tree interface to display their effective policy alongside saved settings.
 
 ## Dispatch the registered tool
 

@@ -47,7 +47,7 @@ final readonly class ResourceRules implements RuleEvaluator
 
     public function getRules(Scope $scope, ResourceReference $resource): RuleSettings
     {
-        [, $owner] = $this->manager($scope, $resource);
+        $owner = $this->managedOwner($scope, $resource);
         $binding = $this->bindingQuery($scope, $resource)->first();
         if ($binding !== null && ! $this->belongsTo($binding, $owner)) {
             throw new RuleAccessDenied('The stored rules belong to a different owner.');
@@ -56,7 +56,14 @@ final readonly class ResourceRules implements RuleEvaluator
         return $this->settings($binding);
     }
 
-    /** @param array{enabled?: bool, rules?: array<string, Verdict|null>} $changes */
+    public function managedOwner(Scope $scope, ResourceReference $resource): OwnerReference
+    {
+        [, $owner] = $this->manager($scope, $resource);
+
+        return $owner;
+    }
+
+    /** @param array{enabled?: bool, rules?: array<array-key, Verdict|null>} $changes */
     public function setRules(Scope $scope, ResourceReference $resource, int $expectedRevision, array $changes): RuleSettings
     {
         [$requester, $owner] = $this->manager($scope, $resource);
@@ -86,6 +93,7 @@ final readonly class ResourceRules implements RuleEvaluator
 
             $rules = $current->rules;
             foreach ($changes['rules'] ?? [] as $key => $verdict) {
+                $key = (string) $key;
                 if (trim($key) !== $key || in_array('', explode('.', $key), true)) {
                     throw new InvalidArgumentException('Rule keys must have non-empty namespace segments.');
                 }
@@ -102,7 +110,7 @@ final readonly class ResourceRules implements RuleEvaluator
                 'resource_binding_id' => $binding->getKey(),
                 'revision' => $updated->revision,
                 'enabled' => $updated->enabled,
-                'rules' => array_map(static fn (Verdict $verdict): string => $verdict->value, $updated->rules),
+                'rules' => (object) array_map(static fn (Verdict $verdict): string => $verdict->value, $updated->rules),
                 'edited_by' => $requester,
             ]);
 
@@ -176,7 +184,7 @@ final readonly class ResourceRules implements RuleEvaluator
             return new RuleSettings(0, true, []);
         }
 
-        /** @var array<string, string> $stored */
+        /** @var array<array-key, string> $stored */
         $stored = $latest->getAttribute('rules');
 
         return new RuleSettings(
