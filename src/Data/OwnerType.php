@@ -8,4 +8,7 @@ enum OwnerType: string
 {
     case PERSON = 'person';
     case HOUSEHOLD = 'household';
+
+    // PHP serializes the case name, so keep HOUSEHOLD for rolling deploys.
+    public const self WORKSPACE = self::HOUSEHOLD;
 }

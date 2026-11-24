@@ -178,7 +178,17 @@ if "$demo"; then
             exit(1);
         }
     '
+    cp "$database" "$scratch/revoked.sqlite"
+    (
+        database="$scratch/revoked.sqlite"
+        in_consumer php "$example/demo.php" prepare
+        artisan queue:work --once --queue=default --tries=1
+        in_consumer php "$example/demo.php" revoke
+        artisan queue:work --once --queue=default --tries=1
+        in_consumer php "$example/demo.php" verify-revoked
+    )
     in_consumer php "$example/demo.php" prepare
+    artisan queue:work --once --queue=default --tries=1
     artisan queue:work --once --queue=default --tries=1
     in_consumer php "$example/demo.php" verify
 fi

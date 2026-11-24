@@ -7,18 +7,22 @@ namespace Ocdejong\SharedToolGovernance\Activity;
 use Carbon\CarbonInterface;
 use Illuminate\Support\Facades\DB;
 use Ocdejong\SharedToolGovernance\Approvals\ApprovalStore;
+use Ocdejong\SharedToolGovernance\Configuration;
 use Ocdejong\SharedToolGovernance\Models\GovernanceInvocation;
 use Ocdejong\SharedToolGovernance\Models\GovernanceOutboxMessage;
 
 /** @internal */
 final class PruneActivity
 {
-    private const int RETENTION_DAYS = 30;
-
     public function prune(): int
     {
         $now = now();
-        $cutoff = $now->copy()->subDays(self::RETENTION_DAYS);
+        $cutoff = $now->copy()->subDays(Configuration::duration('retention_days'));
+        // The timestamp format used for invocation rows starts at year 1.
+        if ($cutoff->year < 1) {
+            return 0;
+        }
+
         $candidates = GovernanceInvocation::query();
         $candidates->where('created_at', '<=', $candidates->getModel()->fromDateTime($cutoff));
         $candidates->getQuery()->whereNotNull('frozen_inputs')->useWritePdo();

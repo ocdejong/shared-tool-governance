@@ -5,30 +5,44 @@ declare(strict_types=1);
 use Illuminate\Contracts\Container\BindingResolutionException;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Queue;
+use Ocdejong\SharedToolGovernance\Activity\Activity;
 use Ocdejong\SharedToolGovernance\Approvals\ApprovalDecision;
+use Ocdejong\SharedToolGovernance\Approvals\ApprovalPreview;
 use Ocdejong\SharedToolGovernance\Approvals\ApprovalResumption;
 use Ocdejong\SharedToolGovernance\Approvals\Approvals;
+use Ocdejong\SharedToolGovernance\Approvals\ApprovalSetupError;
+use Ocdejong\SharedToolGovernance\Approvals\ApprovalUndeliverable;
 use Ocdejong\SharedToolGovernance\Authorization\Authorizer;
 use Ocdejong\SharedToolGovernance\Contracts\ApprovalNotifier;
 use Ocdejong\SharedToolGovernance\Contracts\RuleEvaluator;
 use Ocdejong\SharedToolGovernance\Contracts\ToolExecutor;
+use Ocdejong\SharedToolGovernance\Data\Invocation;
 use Ocdejong\SharedToolGovernance\Data\InvocationContext;
+use Ocdejong\SharedToolGovernance\Data\OwnerReference;
+use Ocdejong\SharedToolGovernance\Data\OwnerType;
 use Ocdejong\SharedToolGovernance\Data\ResourceReference;
 use Ocdejong\SharedToolGovernance\Data\Scope;
 use Ocdejong\SharedToolGovernance\Data\Verdict;
 use Ocdejong\SharedToolGovernance\Data\VerifiedReply;
+use Ocdejong\SharedToolGovernance\Discovery\DiscoveryAccess;
+use Ocdejong\SharedToolGovernance\Discovery\DiscoveryTarget;
+use Ocdejong\SharedToolGovernance\Discovery\ToolDiscovery;
 use Ocdejong\SharedToolGovernance\Jobs\DeliverApproval;
 use Ocdejong\SharedToolGovernance\Jobs\ResumeApproval;
 use Ocdejong\SharedToolGovernance\LocalInbox\LocalInbox;
 use Ocdejong\SharedToolGovernance\Models\GovernanceApproval;
+use Ocdejong\SharedToolGovernance\Models\GovernanceAuditEvent;
 use Ocdejong\SharedToolGovernance\Models\GovernanceGrant;
 use Ocdejong\SharedToolGovernance\Models\GovernanceInvocation;
 use Ocdejong\SharedToolGovernance\Models\GovernanceOutboxMessage;
 use Ocdejong\SharedToolGovernance\Outbox\ApprovalDelivery;
 use Ocdejong\SharedToolGovernance\Outbox\ApprovalWork;
 use Ocdejong\SharedToolGovernance\Rules\ResourceRules;
+use Ocdejong\SharedToolGovernance\Rules\RuleAccessDenied;
 use Ocdejong\SharedToolGovernance\Tests\Approvals\ApprovalHost;
+use Ocdejong\SharedToolGovernance\Tools\ToolRegistry;
 
 beforeEach(function (): void {
     expect(Artisan::call('migrate'))->toBe(0, Artisan::output());
@@ -111,11 +125,8 @@ it('uses the application clock for approvals across time zones', function (strin
     'New York app and Tokyo session' => ['America/New_York', 'Asia/Tokyo'],
 ]);
 
-it('delivers one private card per human and resumes only after all decisions', function (bool $two, bool $sameHuman): void {
+it('delivers one private card per requirement and resumes only after all decisions', function (bool $two): void {
     $host = new ApprovalHost;
-    if ($sameHuman) {
-        $host->householdApprover = 'alice';
-    }
 
     requestApproval($host, $two);
     $scope = $host->context->scope;
@@ -124,14 +135,14 @@ it('delivers one private card per human and resumes only after all decisions', f
     expect($alice)->toHaveCount(1)
         ->and($alice[0]->message)->toContain('Move the repair visit', 'personal', '09:00', '10:00', 'requester', 'Expires')
         ->and($host->inbox->cards($scope, 'requester'))->toBe([])
-        ->and($bob)->toHaveCount($two && ! $sameHuman ? 1 : 0);
+        ->and($bob)->toHaveCount($two ? 1 : 0);
     foreach ([...$alice, ...$bob] as $card) {
         $labels = array_map(static fn (string $line) => strstr($line, ':', true), explode("\n", $card->message));
         expect($labels)->toBe(['Requester', 'Reason', 'Scope and change', 'Audience', 'Expires'])
             ->and($card->message)->not->toContain('private reason marker')
             ->and($card->message)->not->toContain('private argument marker');
     }
-    if ($two && ! $sameHuman) {
+    if ($two) {
         expect($alice[0]->message)->not->toContain('shared')
             ->and($bob[0]->message)->toContain('shared')
             ->and($bob[0]->message)->not->toContain('personal');
@@ -140,7 +151,7 @@ it('delivers one private card per human and resumes only after all decisions', f
     expect($host->decideFromInbox('alice'))->toBeTrue()
         ->and($host->decideFromInbox('alice'))->toBeTrue()
         ->and($host->decideFromInbox('alice', ApprovalDecision::DECLINE))->toBeFalse();
-    if ($two && ! $sameHuman) {
+    if ($two) {
         ApprovalHost::runResumeJobs();
         expect($host->executions)->toBe([])
             ->and(app(Approvals::class)->receipt('visit'))->toBe(['status' => 'pending_approval']);
@@ -168,7 +179,7 @@ it('delivers one private card per human and resumes only after all decisions', f
         ->and(app(Approvals::class)->receipt('visit'))->toBe(['status' => 'granted', 'outcome' => 'success']);
     $worker->context = new InvocationContext($scope, 'alice', 'runtime', ['alice']);
     expect(app(Approvals::class)->receipt('visit'))->toBeNull();
-})->with([[false, false], [true, false], [true, true]]);
+})->with([false, true]);
 
 it('binds a decision to the verified scope, sender and original card', function (): void {
     $host = new ApprovalHost;
@@ -190,6 +201,71 @@ it('binds a decision to the verified scope, sender and original card', function 
     ApprovalHost::runResumeJobs();
     expect($host->executions)->toBe([])
         ->and(app(Approvals::class)->receipt('visit'))->toBe(['status' => 'declined']);
+});
+
+it('isolates rules, discovery, approvals and receipts for identical IDs in two workspaces', function (): void {
+    $host = new ApprovalHost;
+    $host->allHouseholdOwned = true;
+    $host->bind();
+    app()->instance(RuleEvaluator::class, app(ResourceRules::class));
+    $authorizer = app(Authorizer::class);
+    $approvals = app(Approvals::class);
+    $rules = app(ResourceRules::class);
+    $activity = app(Activity::class);
+    $first = new Scope(hostScope: 'tenant', workspaceId: 'team-a');
+    $second = new Scope(hostScope: 'tenant', workspaceId: 'team-b');
+    $resource = new ResourceReference('item', 'personal', 'r1');
+
+    $host->context = new InvocationContext($first, 'bob', 'runtime', ['bob']);
+    $rules->setRules($first, $resource, 0, ['rules' => ['items' => Verdict::DELEGATE]]);
+    $host->context = new InvocationContext($second, 'bob', 'runtime', ['bob']);
+    expect($rules->getRules($second, $resource)->revision)->toBe(0);
+    $rules->setRules($second, $resource, 0, ['rules' => ['items' => Verdict::DENY]]);
+
+    $discover = new ToolDiscovery($host, $host, $rules, app(ToolRegistry::class), static fn () => DiscoveryAccess::VISIBLE);
+    $target = new DiscoveryTarget(new OwnerReference(OwnerType::WORKSPACE, $second->workspaceId), $resource);
+    expect($discover->discover($second, [$target])->actions['items.reschedule'][0]->verdict)->toBe(Verdict::DENY)
+        ->and(fn () => $discover->discover($first, [$target]))->toThrow(RuleAccessDenied::class)
+        ->and(fn () => $discover->discover($first, []))->toThrow(RuleAccessDenied::class);
+
+    $host->context = new InvocationContext($first, 'requester', 'runtime', ['requester']);
+    expect($authorizer->authorize($host->call())->status)->toBe('pending_approval');
+    ApprovalHost::deliverCards();
+    $card = $host->inbox->cards($first, 'bob')[0];
+
+    $host->context = new InvocationContext($second, 'requester', 'runtime', ['requester']);
+    expect($approvals->receipt('visit'))->toBeNull()
+        ->and($activity->recentUse('visit'))->toBe([])
+        ->and($authorizer->authorize($host->call())->status)->toBe('denied')
+        ->and($approvals->decide($card->approvalId, ApprovalDecision::APPROVE, new VerifiedReply($second, 'bob', $card->cardId, 'reply')))->toBeFalse()
+        ->and($approvals->receipt('visit'))->toBe(['status' => 'denied'])
+        ->and($activity->recentUse('visit')[0]['status'])->toBe('denied');
+
+    $host->context = new InvocationContext($first, 'requester', 'runtime', ['requester']);
+    expect($host->decideFromInbox('bob'))->toBeTrue();
+    ApprovalHost::runResumeJobs();
+    expect($host->executions)->toHaveCount(1)
+        ->and($host->executions[0]->context->scope)->toEqual($first)
+        ->and($approvals->receipt('visit'))->toBe(['status' => 'granted', 'outcome' => 'success'])
+        ->and($activity->recentUse('visit')[0]['status'])->toBe('granted')
+        ->and(DB::table('governance_resource_bindings')->pluck('owner_type')->all())->toBe(['household', 'household'])
+        ->and(DB::table('governance_approvals')->value('owner_type'))->toBe('household');
+});
+
+it('refuses a reply and receipt when the relevant members leave the workspace', function (): void {
+    $host = new ApprovalHost;
+    $host->context = new InvocationContext($host->context->scope, 'requester', 'runtime', ['requester', 'bob']);
+    requestApproval($host);
+    $host->members = ['requester', 'alice'];
+    $discovery = new ToolDiscovery($host, $host, $host, [], static fn () => throw new LogicException('Check membership before visibility.'));
+
+    expect(fn () => $discovery->discover($host->context->scope, []))->toThrow(RuleAccessDenied::class)
+        ->and($host->decideFromInbox('alice'))->toBeFalse()
+        ->and(app(Approvals::class)->receipt('visit'))->toBeNull()
+        ->and(app(Activity::class)->recentUse('visit'))->toBe([])
+        ->and(app(Authorizer::class)->authorize($host->call())->status)->toBe('denied')
+        ->and(GovernanceApproval::query()->firstOrFail()->getAttribute('decision'))->toBeNull();
+    Queue::assertNotPushed(ResumeApproval::class);
 });
 
 it('expires both unanswered cards and fully approved calls awaiting a worker', function (bool $approve): void {
@@ -282,13 +358,117 @@ it('records an uncertain downstream result without retrying execution', function
         ->and(app(Approvals::class)->receipt('visit'))->toBe(['status' => 'granted', 'outcome' => 'unknown']);
 });
 
-it('stages the request and its cards together and enqueues delivery after commit', function (): void {
+it('reports an unreachable owner after commit while the request keeps its expiry', function (
+    ?string $householdApprover,
+    array $approversByResource,
+    bool $allHouseholdOwned,
+): void {
+    $this->freezeSecond();
+    $host = new ApprovalHost;
+    $host->householdApprover = $householdApprover;
+    $host->approversByResource = $approversByResource;
+    $host->allHouseholdOwned = $allHouseholdOwned;
+    $host->bind();
+    $authorizer = app(Authorizer::class);
+    $call = $host->call(two: true);
+    $reported = [];
+    Event::listen(ApprovalUndeliverable::class, function (ApprovalUndeliverable $event) use (&$reported): void {
+        expect(DB::transactionLevel())->toBe(0);
+        $reported[] = $event;
+    });
+
+    DB::beginTransaction();
+    try {
+        $result = $authorizer->authorize($call);
+        expect($result->jsonSerialize())->toBe(['status' => 'pending_approval', 'request_id' => 'visit'])
+            ->and($result->grantToken())->toBeNull()
+            ->and(GovernanceApproval::query()->count())->toBe(0)
+            ->and(GovernanceOutboxMessage::query()->count())->toBe(0)
+            ->and(GovernanceGrant::query()->count())->toBe(0)
+            ->and($reported)->toBe([]);
+        Queue::assertNothingPushed();
+    } finally {
+        DB::rollBack();
+    }
+    expect($reported)->toBe([])
+        ->and(GovernanceAuditEvent::query()->count())->toBe(0);
+
+    DB::transaction(function () use ($authorizer, $call, &$reported): void {
+        $authorizer->authorize($call);
+        expect($reported)->toBe([]);
+    });
+    $authorizer->authorize($call);
+
+    expect($reported)->toHaveCount(1)
+        ->and($reported[0]->invocationId)->toBe($call->id)
+        ->and($reported[0]->scope)->toEqual($host->context->scope);
+    $audit = GovernanceAuditEvent::query()->where('event', 'approval_undeliverable')->sole();
+    expect($audit->getAttribute('invocation_row_id'))->toBe(GovernanceInvocation::query()->sole()->getKey())
+        ->and($audit->getAttribute('details'))->toBe([]);
+    Queue::assertNothingPushed();
+
+    $this->travel(14)->minutes();
+    expect(app(Approvals::class)->receipt($call->id))->toBe(['status' => 'pending_approval']);
+    $this->travel(1)->minutes();
+    expect(app(Approvals::class)->receipt($call->id))->toBe(['status' => 'expired']);
+    app(ApprovalWork::class)->recover();
+    ApprovalHost::runResumeJobs();
+    expect($host->executions)->toBe([]);
+})->with([
+    'no approver' => [null, [], false],
+    'empty approver' => ['', [], false],
+    'approver outside the scope' => ['stranger', [], false],
+    'approver is not the personal owner' => ['bob', ['personal' => 'bob'], false],
+    'same person for two owners' => ['alice', [], false],
+    'conflicting approvers for one owner' => ['bob', ['personal' => 'alice'], true],
+]);
+
+it('rolls back delegated calls whose tool cannot provide every approval preview', function (?Closure $preview): void {
+    Event::fake([ApprovalUndeliverable::class]);
+    $host = new ApprovalHost;
+    $validPreview = $host->approvalPreview;
+    $host->approvalPreview = $preview;
+    $host->bind();
+    $call = $host->call(two: true);
+
+    expect(fn () => app(Authorizer::class)->authorize($call))->toThrow(
+        fn (ApprovalSetupError $error) => expect($error->invocationId)->toBe($call->id),
+    );
+
+    expect(app(Approvals::class)->receipt($call->id))->toBeNull()
+        ->and(GovernanceInvocation::query()->count())->toBe(0)
+        ->and(GovernanceAuditEvent::query()->count())->toBe(0)
+        ->and(GovernanceApproval::query()->count())->toBe(0)
+        ->and(GovernanceOutboxMessage::query()->count())->toBe(0)
+        ->and(GovernanceGrant::query()->count())->toBe(0)
+        ->and($host->executions)->toBe([]);
+    Queue::assertNothingPushed();
+    Event::assertNotDispatched(ApprovalUndeliverable::class);
+
+    $host->approvalPreview = $validPreview;
+    $host->bind();
+    expect(app(Authorizer::class)->authorize($call)->status)->toBe('pending_approval');
+    Queue::assertPushed(DeliverApproval::class, 2);
+})->with([
+    'missing callback' => [null],
+    'null preview for the second approver' => [static fn (Invocation $call, array $targets, string $approver): ?ApprovalPreview => $approver === 'alice'
+        ? new ApprovalPreview('Valid reason', 'Valid change')
+        : null],
+    'blank preview reason' => [static fn () => new ApprovalPreview("\u{00A0}\t", 'Valid change')],
+    'blank preview scope and change' => [static fn () => new ApprovalPreview('Valid reason', " \n")],
+]);
+
+it('stages the request and all its cards together and enqueues delivery after commit', function (): void {
     $host = new ApprovalHost;
     $host->bind();
 
     DB::beginTransaction();
     try {
-        app(Authorizer::class)->authorize($host->call());
+        app(Authorizer::class)->authorize($host->call(two: true));
+        expect(GovernanceInvocation::query()->count())->toBe(1)
+            ->and(GovernanceApproval::query()->count())->toBe(2)
+            ->and(GovernanceOutboxMessage::query()->count())->toBe(2)
+            ->and(GovernanceGrant::query()->count())->toBe(0);
         Queue::assertNothingPushed();
     } finally {
         DB::rollBack();
@@ -296,16 +476,21 @@ it('stages the request and its cards together and enqueues delivery after commit
 
     app(ApprovalWork::class)->recover();
     Queue::assertNothingPushed();
-    expect(app(Approvals::class)->receipt('visit'))->toBeNull();
+    expect(app(Approvals::class)->receipt('visit'))->toBeNull()
+        ->and(GovernanceApproval::query()->count())->toBe(0)
+        ->and(GovernanceOutboxMessage::query()->count())->toBe(0);
 
-    requestApproval($host);
-    expect($host->inbox->cards($host->context->scope, 'alice'))->toHaveCount(1);
+    requestApproval($host, two: true);
+    expect($host->inbox->cards($host->context->scope, 'alice'))->toHaveCount(1)
+        ->and($host->inbox->cards($host->context->scope, 'bob'))->toHaveCount(1)
+        ->and($host->executions)->toBe([]);
 });
 
 it('recovers undelivered work and retries delivery with the same private card ID', function (): void {
     $host = new ApprovalHost;
     $host->bind();
     app(Authorizer::class)->authorize($host->call());
+    $deliveryId = GovernanceOutboxMessage::query()->sole()->getAttribute('delivery_id');
 
     $flaky = new class($host->inbox) implements ApprovalNotifier
     {
@@ -328,13 +513,16 @@ it('recovers undelivered work and retries delivery with the same private card ID
     app()->instance(ApprovalNotifier::class, $flaky);
     $job = Queue::pushed(DeliverApproval::class)->sole();
     expect(fn () => $job->handle(app(ApprovalDelivery::class)))->toThrow(RuntimeException::class, 'Delivery confirmation was lost.');
-    expect($host->decideFromInbox('alice'))->toBeFalse();
+    expect($host->decideFromInbox('alice'))->toBeFalse()
+        ->and($host->executions)->toBe([]);
 
     Queue::fake();
     app(ApprovalWork::class)->recover();
     ApprovalHost::deliverCards();
 
-    expect($host->inbox->cards($host->context->scope, 'alice'))->toHaveCount(1)
+    $cards = $host->inbox->cards($host->context->scope, 'alice');
+    expect($cards)->toHaveCount(1)
+        ->and($cards[0]->approvalId)->toBe($deliveryId)
         ->and($host->decideFromInbox('alice'))->toBeTrue();
     ApprovalHost::runResumeJobs();
     expect($host->executions)->toHaveCount(1);

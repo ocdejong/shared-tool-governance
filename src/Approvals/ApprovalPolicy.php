@@ -52,6 +52,10 @@ final readonly class ApprovalPolicy
             return null;
         }
 
+        if (in_array($row->getAttribute('status'), ['approved', 'granted'], true) && ! ApprovalStore::hasDistinctConsent($row)) {
+            return null;
+        }
+
         $decisions = $this->policy->evaluate($frozen);
         if ($decisions === null || $decisions !== $inputs['decisions']
             || $this->policy->approvalRequirements($frozen, $decisions) !== $inputs['approval_requirements']) {

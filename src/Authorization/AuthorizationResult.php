@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Ocdejong\SharedToolGovernance\Authorization;
 
 use JsonSerializable;
+use Ocdejong\SharedToolGovernance\Data\ExecutionStatus;
 use SensitiveParameter;
 use SensitiveParameterValue;
 
@@ -16,6 +17,7 @@ final readonly class AuthorizationResult implements JsonSerializable
         public string $status,
         private ?string $requestId = null,
         #[SensitiveParameter] ?string $token = null,
+        private ?ExecutionStatus $executionOutcome = null,
     ) {
         $this->token = $token === null ? null : new SensitiveParameterValue($token);
     }
@@ -23,6 +25,11 @@ final readonly class AuthorizationResult implements JsonSerializable
     public function grantToken(): ?string
     {
         return $this->token?->getValue();
+    }
+
+    public function executionOutcome(): ?ExecutionStatus
+    {
+        return $this->executionOutcome;
     }
 
     /** @return array{status: string, request_id?: string} */

@@ -32,6 +32,10 @@ final readonly class FrozenCall
     public function fingerprint(): string
     {
         $fields = get_object_vars($this->call);
+        $context = $this->call->context;
+        $fields['context'] = get_object_vars($context);
+        // Stored calls hash this key and field order.
+        $fields['context']['scope'] = ['hostScope' => $context->scope->hostScope, 'householdId' => $context->scope->workspaceId];
         $fields['arguments'] = self::canonicalize($this->call->arguments);
         $fields['action'] = $this->tool->actionKey;
         $fields['effect'] = $this->tool->effect;

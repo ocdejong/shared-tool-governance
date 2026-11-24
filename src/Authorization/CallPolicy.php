@@ -5,28 +5,39 @@ declare(strict_types=1);
 namespace Ocdejong\SharedToolGovernance\Authorization;
 
 use InvalidArgumentException;
+use Ocdejong\SharedToolGovernance\Approvals\ApprovalAssignments;
+use Ocdejong\SharedToolGovernance\Contracts\ApproverPolicy;
 use Ocdejong\SharedToolGovernance\Contracts\ResourceAuthority;
 use Ocdejong\SharedToolGovernance\Contracts\RuleEvaluator;
 use Ocdejong\SharedToolGovernance\Contracts\TrustedInvocationContext;
+use Ocdejong\SharedToolGovernance\Data\ApprovalMode;
 use Ocdejong\SharedToolGovernance\Data\Invocation;
 use Ocdejong\SharedToolGovernance\Data\InvocationContext;
 use Ocdejong\SharedToolGovernance\Data\OwnerReference;
 use Ocdejong\SharedToolGovernance\Data\OwnerType;
+use Ocdejong\SharedToolGovernance\Data\ResourceReference;
+use Ocdejong\SharedToolGovernance\Data\Scope;
 use Ocdejong\SharedToolGovernance\Data\Verdict;
 use Ocdejong\SharedToolGovernance\Tools\ToolRegistry;
 
 /**
  * @phpstan-type Decision array{owner_type: string, owner_id: string, verdict: string, rule_key: string|null, rule_revision: int|null}
- * @phpstan-type Requirement array{owner_type: string, owner_id: string, approver_id: string}
+ * @phpstan-type Eligibility array{approver_id: string}|array{mode: string, eligible_people: list<string>}
+ * @phpstan-type Requirement array{owner_type: string, owner_id: string, approver_id: string}|array{owner_type: string, owner_id: string, mode: string, eligible_people: list<string>, effective_people?: list<string>}
  */
 final readonly class CallPolicy
 {
+    private ScopeAccess $access;
+
     public function __construct(
         private ToolRegistry $tools,
         private TrustedInvocationContext $context,
         private ResourceAuthority $authority,
         private RuleEvaluator $rules,
-    ) {}
+        private ?ApproverPolicy $approvers = null,
+    ) {
+        $this->access = new ScopeAccess($authority);
+    }
 
     public function freeze(Invocation $proposal): FrozenCall
     {
@@ -74,19 +85,14 @@ final readonly class CallPolicy
 
         $context = $frozen->call->context;
         $scope = $context->scope;
-        foreach (array_unique([$context->requesterId, ...$context->audience], SORT_STRING) as $person) {
-            if (! $this->authority->isMember($scope, $person)) {
-                return null;
-            }
+        if (! $this->allowsParticipants($frozen)) {
+            return null;
         }
 
         $owners = [];
         foreach ($frozen->targets as $target) {
             $owner = $this->authority->ownerOf($scope, $target);
-            if ($owner === null || match ($owner->type) {
-                OwnerType::PERSON => ! $this->authority->isMember($scope, $owner->id),
-                OwnerType::HOUSEHOLD => $owner->id !== $scope->householdId,
-            }) {
+            if ($owner === null || ! $this->access->includesOwner($scope, $owner)) {
                 return null;
             }
 
@@ -124,23 +130,93 @@ final readonly class CallPolicy
             }
 
             $owner = new OwnerReference(OwnerType::from($decision['owner_type']), $decision['owner_id']);
-            $approver = $this->authority->approverFor($scope, $frozen->targets[$index], $owner);
-            if ($approver === null || $approver === ''
-                || ($owner->type === OwnerType::PERSON && $owner->id !== $approver)
-                || ! $this->authority->isMember($scope, $approver)) {
-                return null;
-            }
-
+            $eligibility = $this->eligibility($scope, $frozen->targets[$index], $owner);
             $key = $owner->type->value.':'.$owner->id;
-            if (isset($owners[$key]) && $owners[$key] !== $approver) {
+            if ($eligibility === null || (isset($owners[$key]) && $owners[$key] !== $eligibility)) {
                 return null;
             }
 
-            $owners[$key] = $approver;
-            $requirements[$index] = ['owner_type' => $owner->type->value, 'owner_id' => $owner->id, 'approver_id' => $approver];
+            $owners[$key] = $eligibility;
+            $requirements[$index] = ['owner_type' => $owner->type->value, 'owner_id' => $owner->id] + $eligibility;
+        }
+
+        $effective = self::effectivePeople($owners);
+        if ($effective === null) {
+            return null;
+        }
+
+        foreach ($requirements as $index => $requirement) {
+            $key = $requirement['owner_type'].':'.$requirement['owner_id'];
+            if (isset($requirement['eligible_people'], $effective[$key]) && $effective[$key] !== $requirement['eligible_people']) {
+                $requirements[$index]['effective_people'] = $effective[$key];
+            }
         }
 
         return $requirements;
+    }
+
+    /** @return Eligibility|null */
+    private function eligibility(Scope $scope, ResourceReference $resource, OwnerReference $owner): ?array
+    {
+        $rule = $this->approvers?->approvalRuleFor($scope, $resource, $owner);
+        if ($rule === null) {
+            $approver = $this->authority->approverFor($scope, $resource, $owner);
+            if ($approver === null || $approver === ''
+                || ($owner->type === OwnerType::PERSON && $approver !== $owner->id)
+                || ! $this->access->allows($scope, $scope, $approver)) {
+                return null;
+            }
+
+            return ['approver_id' => $approver];
+        }
+
+        $people = $rule->eligiblePeople;
+        if ($people === [] || in_array('', $people, true) || ! $this->access->allows($scope, $scope, ...$people)) {
+            return null;
+        }
+
+        return ['mode' => $rule->mode->value, 'eligible_people' => $people];
+    }
+
+    /**
+     * @param  array<string, Eligibility>  $owners
+     * @return array<string, list<string>>|null
+     */
+    private static function effectivePeople(array $owners): ?array
+    {
+        $slots = [];
+        $anySlots = [];
+        foreach ($owners as $owner => $eligibility) {
+            if (($eligibility['mode'] ?? null) === ApprovalMode::ANY->value) {
+                $anySlots[$owner] = count($slots);
+                $slots[] = $eligibility['eligible_people'];
+
+                continue;
+            }
+
+            foreach ($eligibility['eligible_people'] ?? [$eligibility['approver_id']] as $person) {
+                $slots[] = [$person];
+            }
+        }
+
+        if (! ApprovalAssignments::possible($slots)) {
+            return null;
+        }
+
+        $effective = [];
+        foreach ($anySlots as $owner => $slot) {
+            $effective[$owner] = ApprovalAssignments::viablePeople($slots, $slot);
+        }
+
+        return $effective;
+    }
+
+    /** @internal */
+    public function allowsParticipants(FrozenCall $frozen): bool
+    {
+        $context = $frozen->call->context;
+
+        return $this->access->allowsContext($context->scope, $context);
     }
 
     /** @return list<string> */

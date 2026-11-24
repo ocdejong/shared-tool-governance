@@ -117,7 +117,7 @@ final class Fixture implements ResourceAuthority, RuleEvaluator, ToolExecutor, T
     {
         return match ($resource->id) {
             'item-1' => new OwnerReference(OwnerType::PERSON, $this->owner),
-            'item-2' => new OwnerReference(OwnerType::HOUSEHOLD, $this->householdOwner ?? $scope->householdId),
+            'item-2' => new OwnerReference(OwnerType::WORKSPACE, $this->householdOwner ?? $scope->workspaceId),
             default => null,
         };
     }

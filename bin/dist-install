@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    echo 'Usage: bin/dist-install <rev> | --github <rev> | --packagist <version> <rev>' >&2
+    exit 2
+}
+
+case "${1:-}" in
+    --github)
+        (( $# == 2 )) || usage
+        mode=github
+        shift
+        ;;
+    --packagist)
+        (( $# == 3 )) && [[ -n $2 ]] || usage
+        mode=packagist
+        release_version=$2
+        shift 2
+        ;;
+    --*|'')
+        usage
+        ;;
+    *)
+        (( $# == 1 )) || usage
+        mode=local
+        ;;
+esac
+
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+revision=$(git -C "$repo" rev-parse --verify --end-of-options "${1}^{commit}")
+package=ocdejong/shared-tool-governance
+version="${release_version:-0.0.0-alpha+$revision}"
+scratch=$(mktemp -d)
+trap 'rm -rf -- "$scratch"' EXIT
+
+archive_name="shared-tool-governance-$revision"
+archive="$scratch/artifacts/$archive_name.zip"
+github_zip="https://api.github.com/repos/$package/zipball/$revision"
+database="$scratch/consumer/database/database.sqlite"
+app_key=$(php -r 'echo "base64:".base64_encode(random_bytes(32));')
+
+in_consumer() {
+    env -i PATH="$PATH" HOME="$scratch" COMPOSER_HOME="$scratch/composer" \
+        COMPOSER_CACHE_DIR="${COMPOSER_CACHE_DIR:-$HOME/.cache/composer}" \
+        APP_ENV=testing APP_KEY="$app_key" DB_CONNECTION=sqlite DB_DATABASE="$database" \
+        QUEUE_CONNECTION=database CACHE_STORE=database "$@"
+}
+
+compose() {
+    in_consumer composer --no-interaction --no-ansi --no-plugins "$@"
+}
+
+git -C "$repo" ls-tree -r --name-only "$revision" -- database/migrations > "$scratch/migrations"
+if [[ $mode == local ]]; then
+    mkdir "$scratch/export" "$scratch/artifacts"
+    git -C "$repo" archive "$revision" | tar -x -C "$scratch/export"
+    (
+        cd "$scratch/export"
+        in_consumer php -r '
+            $manifest = json_decode(file_get_contents("composer.json"), true, flags: JSON_THROW_ON_ERROR);
+            $manifest["version"] = $argv[1];
+            if (file_put_contents("composer.json", json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)."\n") === false) {
+                exit(1);
+            }
+        ' "$version"
+        compose archive --format=zip --dir="$scratch/artifacts" --file="$archive_name"
+    )
+    rm -rf -- "$scratch/export"
+fi
+
+cd "$scratch"
+compose create-project --no-dev --no-scripts --prefer-dist --no-progress \
+    laravel/laravel consumer '^13.0'
+cd "$scratch/consumer"
+touch "$database"
+case "$mode" in
+    local)
+        compose config repositories.governance artifact ../artifacts
+        expected_dist=$archive
+        ;;
+    github)
+        # Before publication, supply the metadata Packagist derives from the tagged commit.
+        metadata=$(git -C "$repo" show "$revision:composer.json" | in_consumer php -r '
+            $manifest = json_decode(stream_get_contents(STDIN), true, flags: JSON_THROW_ON_ERROR);
+            $manifest["version"] = $argv[1];
+            $manifest["dist"] = ["type" => "zip", "url" => $argv[2], "reference" => $argv[3]];
+            echo json_encode(["type" => "package", "package" => $manifest], JSON_THROW_ON_ERROR);
+        ' "$version" "$github_zip" "$revision")
+        compose config repositories.governance "$metadata"
+        expected_dist=$github_zip
+        ;;
+    packagist)
+        expected_dist=$github_zip
+        ;;
+esac
+# Run the documented shell commands. Pin only the package resolution in this
+# disposable consumer, so a newer public release cannot change the test subject.
+composer() {
+    if [[ $# -eq 2 && $1 == require && $2 == "$package" ]]; then
+        compose require --update-no-dev --prefer-dist --no-progress "$package:$version"
+    else
+        command composer "$@"
+    fi
+}
+
+php() {
+    in_consumer php "$@"
+}
+
+run_readme_block() {
+    local block=$1 readme=$2 commands
+    commands=$(awk -v block="$block" '
+        $0 == "<!-- " block " -->" { section = 1; next }
+        $0 == "<!-- /" block " -->" { complete = 1; exit }
+        section && $0 == "```sh" { shell = 1; next }
+        section && $0 == "```" { shell = 0; next }
+        shell { print }
+        END { if (!complete) exit 1 }
+    ' "$readme")
+    [[ -n $commands ]] || return 1
+    source /dev/stdin <<< "$commands"
+}
+
+git -C "$repo" show "$revision:README.md" > "$scratch/README.md"
+run_readme_block appointment-install "$scratch/README.md"
+installed_readme="vendor/$package/README.md"
+cmp "$scratch/README.md" "$installed_readme"
+run_readme_block appointment-example "$installed_readme"
+test ! -e config/shared-tool-governance.php
+run_readme_block appointment-config "$installed_readme"
+test -f config/shared-tool-governance.php
+
+cat > verify-dist.php <<'PHP'
+<?php
+
+declare(strict_types=1);
+
+use Composer\InstalledVersions;
+use Illuminate\Contracts\Console\Kernel;
+use Illuminate\Support\Facades\DB;
+
+require __DIR__.'/vendor/autoload.php';
+
+function check(bool $condition, string $message): void
+{
+    if (! $condition) {
+        throw new RuntimeException($message);
+    }
+}
+
+function verifyDist(array $argv): void
+{
+    $app = require __DIR__.'/bootstrap/app.php';
+    $app->make(Kernel::class)->bootstrap();
+
+    [, $package, $version, $mode, $expectedDist, $revision, $manifest] = $argv;
+    $installed = InstalledVersions::getInstallPath($package);
+    check($installed !== null && realpath($installed) === __DIR__.'/vendor/'.$package && ! is_link($installed),
+        'Expected an extracted vendor package.');
+    check(ltrim(InstalledVersions::getPrettyVersion($package) ?? '', 'vV') === ltrim($version, 'vV'),
+        'Composer selected a different version.');
+    $installedMetadata = json_decode(file_get_contents(__DIR__.'/vendor/composer/installed.json'), true, flags: JSON_THROW_ON_ERROR);
+    $entries = array_column($installedMetadata['packages'], null, 'name');
+    $entry = $entries[$package] ?? [];
+    $dist = $entry['dist'] ?? [];
+    $url = $dist['url'] ?? '';
+    check(($entry['installation-source'] ?? null) === 'dist' && ($dist['type'] ?? null) === 'zip',
+        'Composer did not install a ZIP distribution.');
+    if ($mode === 'local') {
+        check(realpath($url) === realpath($expectedDist) && ! isset($entry['source']),
+            'Composer did not resolve the local archive.');
+    } else {
+        check($url === $expectedDist && ($dist['reference'] ?? null) === $revision,
+            'Composer did not resolve the expected GitHub ZIP and commit.');
+    }
+
+    foreach (['src', 'config', 'database'] as $directory) {
+        check(is_dir($installed.'/'.$directory), "Missing package directory $directory.");
+    }
+    $developmentFiles = [
+        '.git', '.gitattributes', '.github', '.gitignore', '.phpunit.cache', 'AGENTS.md', 'bin',
+        'composer.lock', 'phpstan.neon.dist', 'phpunit.xml.dist', 'pint.json', 'tests', 'vendor',
+    ];
+    foreach ($developmentFiles as $excluded) {
+        check(! file_exists($installed.'/'.$excluded), "Unexpected package entry $excluded.");
+    }
+
+    $migrations = file($manifest, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    check($migrations !== false && $migrations !== [], 'The source revision has no package migrations.');
+    $ran = DB::table('migrations')->pluck('migration')->all();
+    foreach ($migrations as $migration) {
+        check(is_file($installed.'/'.$migration) && in_array(basename($migration, '.php'), $ran, true),
+            "Package migration missing or not run: $migration");
+    }
+}
+
+try {
+    verifyDist($argv);
+} catch (Throwable $error) {
+    fwrite(STDERR, $error->getMessage().PHP_EOL);
+    exit(1);
+}
+PHP
+
+in_consumer php verify-dist.php "$package" "$version" "$mode" "$expected_dist" "$revision" "$scratch/migrations"
+
+echo "Distribution install passed for $revision ($version, $mode)."
+if [[ $mode == local ]]; then
+    output=$(mktemp -d)
+    cp "$archive" "$output/"
+    echo 'SHA-256 and artifact path:'
+    sha256sum "$output/$archive_name.zip"
+fi

@@ -48,7 +48,7 @@ it('allows the same call ID in a different tenant or household and rejects reuse
     expect(fn () => fixtureInvocation())->toThrow(UniqueConstraintViolationException::class);
 });
 
-it('allows each owner only one approval per invocation', function (): void {
+it('allows one card per invocation, owner and eligible person', function (): void {
     $invocation = fixtureInvocation();
     $otherInvocation = fixtureInvocation(['invocation_id' => 'call-2']);
     $approval = [
@@ -70,10 +70,15 @@ it('allows each owner only one approval per invocation', function (): void {
         'invocation_row_id' => $otherInvocation->getKey(),
     ] + $approval);
 
-    expect(fn () => GovernanceApproval::query()->forceCreate([
+    $additionalCard = GovernanceApproval::query()->forceCreate([
         'approval_id' => (string) Str::ulid(),
         'approver_id' => 'person-3',
+    ] + $approval);
+
+    expect(fn () => GovernanceApproval::query()->forceCreate([
+        'approval_id' => (string) Str::ulid(),
     ] + $approval))->toThrow(UniqueConstraintViolationException::class);
+    $additionalCard->delete();
 });
 
 it('gives an invocation one redemption slot and keeps token hashes unique', function (): void {

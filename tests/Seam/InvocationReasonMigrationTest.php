@@ -42,6 +42,7 @@ it('upgrades pre-change reasons, preserves pending approval and restores only re
     expect(Artisan::call('migrate', ['--realpath' => true, '--path' => [
         $directory.'/2026_11_24_000000_create_governance_tables.php',
         $directory.'/2026_11_24_000001_add_receipt_targets_to_governance_invocations.php',
+        $directory.'/2026_11_24_000005_add_eligible_approval_cards.php',
     ]]))->toBe(0, Artisan::output());
     $this->beforeApplicationDestroyed(function (): void {
         expect(Artisan::call('migrate:reset'))->toBe(0, Artisan::output());
@@ -52,6 +53,9 @@ it('upgrades pre-change reasons, preserves pending approval and restores only re
     $host->bind();
     $policy = app(CallPolicy::class);
     $pending = $policy->freeze($host->call('pending'));
+    // Recorded by the pre-workspace authorizer at c72f153.
+    $baselineFingerprint = 'c0599d994eb15c8eeb34d9ca47e0c31bbacdb4583e1f73932646e56941846902';
+    expect($pending->fingerprint())->toBe($baselineFingerprint);
     $decisions = $policy->evaluate($pending) ?? throw new LogicException('Expected a rule decision.');
     $requirements = $policy->approvalRequirements($pending, $decisions) ?? throw new LogicException('Expected approval requirements.');
     $inputs = $pending->inputs() + ['decisions' => $decisions, 'approval_requirements' => $requirements];
@@ -80,7 +84,7 @@ it('upgrades pre-change reasons, preserves pending approval and restores only re
             'runtime_id' => 'runtime',
             'executor_id' => 'worker',
             'audience' => ['requester'],
-            'fingerprint' => $frozen->fingerprint(),
+            'fingerprint' => $id === 'pending' ? $baselineFingerprint : $frozen->fingerprint(),
         ]);
         if ($fields['status'] === 'pending_approval') {
             ApprovalStore::stage($row, $frozen, $requirements);
@@ -99,8 +103,10 @@ it('upgrades pre-change reasons, preserves pending approval and restores only re
     approveMigrationCard($host, $legacyCard);
     expect(app(Approvals::class)->receipt('legacy-window'))->toBe(['status' => 'granted', 'outcome' => 'success']);
 
+    // Install the deadline column so the current authorizer can run before the reason data migration.
     expect(Artisan::call('migrate', ['--realpath' => true, '--path' => [
         $directory.'/2026_11_24_000002_allow_encrypted_invocation_reasons.php',
+        $directory.'/2026_11_24_000004_add_approval_deadline_to_governance_invocations.php',
     ]]))->toBe(0, Artisan::output())
         ->and(Schema::hasColumn('governance_invocations', 'reason'))->toBeTrue();
     $activity = app(Activity::class);
@@ -131,7 +137,9 @@ it('upgrades pre-change reasons, preserves pending approval and restores only re
         ->and(DB::table('governance_invocations')->where('invocation_id', 'pruned')->value('frozen_inputs'))->toBeNull()
         ->and(DB::table('governance_invocations')->where('invocation_id', 'terminal')->value('frozen_inputs'))->not->toContain('Legacy terminal reason');
 
-    expect(Artisan::call('migrate:rollback', ['--step' => 1]))->toBe(0, Artisan::output())
+    expect(Artisan::call('migrate:rollback', ['--realpath' => true, '--path' => [
+        $directory.'/2026_11_24_000003_move_invocation_reason_into_frozen_inputs.php',
+    ]]))->toBe(0, Artisan::output())
         ->and(DB::table('governance_invocations')->orderBy('id')->pluck('reason', 'invocation_id')->all())->toBe([
             'legacy-window' => $pending->call->reason,
             'pending' => $pending->call->reason,

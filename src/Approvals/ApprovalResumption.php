@@ -5,14 +5,18 @@ declare(strict_types=1);
 namespace Ocdejong\SharedToolGovernance\Approvals;
 
 use DomainException;
+use Illuminate\Support\Facades\App;
+use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\DB;
 use Ocdejong\SharedToolGovernance\Authorization\FrozenCall;
+use Ocdejong\SharedToolGovernance\Contracts\CompletionHandler;
 use Ocdejong\SharedToolGovernance\Contracts\ToolExecutor;
 use Ocdejong\SharedToolGovernance\Data\ExecutionStatus;
 use Ocdejong\SharedToolGovernance\Execution\ExecuteTool;
 use Ocdejong\SharedToolGovernance\Grants\GrantClock;
 use Ocdejong\SharedToolGovernance\Grants\GrantService;
 use Ocdejong\SharedToolGovernance\Grants\RedemptionRefused;
+use Ocdejong\SharedToolGovernance\Jobs\DeliverCompletion;
 use Ocdejong\SharedToolGovernance\Models\GovernanceGrant;
 use Ocdejong\SharedToolGovernance\Models\GovernanceInvocation;
 use SensitiveParameter;
@@ -42,7 +46,11 @@ final readonly class ApprovalResumption
             return;
         }
 
-        $this->executor->run($executor, $rowId, $frozen->call, $frozen->targets);
+        $call = $frozen->call;
+        $result = $this->executor->run($executor, $rowId, $call, $frozen->targets);
+        if (App::bound(CompletionHandler::class)) {
+            Bus::dispatch(new DeliverCompletion($call->context->scope, $call->id, $result));
+        }
     }
 
     /** @return array{string, ToolExecutor}|null */

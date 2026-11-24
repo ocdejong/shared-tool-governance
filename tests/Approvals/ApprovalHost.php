@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Ocdejong\SharedToolGovernance\Tests\Approvals;
 
+use Closure;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Queue;
 use Ocdejong\SharedToolGovernance\Approvals\ApprovalDecision;
@@ -48,6 +49,13 @@ final class ApprovalHost implements ResourceAuthority, ResumptionContext, RuleEv
 
     public ?string $householdApprover = 'bob';
 
+    public bool $allHouseholdOwned = false;
+
+    public bool $includeThirdOwner = false;
+
+    /** @var array<string, string> */
+    public array $approversByResource = [];
+
     public string $personalOwner = 'alice';
 
     public bool $deny = false;
@@ -65,9 +73,16 @@ final class ApprovalHost implements ResourceAuthority, ResumptionContext, RuleEv
     /** @var list<Invocation> */
     public array $executions = [];
 
+    /** @var (Closure(Invocation, list<ResourceReference>, string): ?ApprovalPreview)|null */
+    public ?Closure $approvalPreview;
+
     public function __construct(public readonly LocalInbox $inbox = new LocalInbox)
     {
         $this->context = new InvocationContext(new Scope('tenant', 'home'), 'requester', 'runtime', ['requester']);
+        $this->approvalPreview = static fn (Invocation $call, array $targets): ApprovalPreview => new ApprovalPreview(
+            'Move the repair visit',
+            implode(', ', array_column($targets, 'id')).' at 09:00 → '.$call->arguments['scheduled_time'],
+        );
     }
 
     public function bind(string $executorId = 'worker'): void
@@ -88,14 +103,12 @@ final class ApprovalHost implements ResourceAuthority, ResumptionContext, RuleEv
             resolveTargets: fn (array $arguments): array => [
                 new ResourceReference('item', 'personal', $this->revision),
                 ...($arguments['two'] ? [new ResourceReference('item', 'shared', 'r2')] : []),
+                ...($this->includeThirdOwner ? [new ResourceReference('item', 'third', 'r3')] : []),
             ],
             executorId: $executorId,
             effect: 'Reschedule the selected items',
             resultSchema: [],
-            approvalPreview: static fn (Invocation $call, array $targets, string $approver): ApprovalPreview => new ApprovalPreview(
-                'Move the repair visit',
-                implode(', ', array_column($targets, 'id')).' at 09:00 → '.$call->arguments['scheduled_time'],
-            ),
+            approvalPreview: $this->approvalPreview,
         ));
         app()->instance(ToolRegistry::class, $tools);
     }
@@ -163,8 +176,11 @@ final class ApprovalHost implements ResourceAuthority, ResumptionContext, RuleEv
     public function ownerOf(Scope $scope, ResourceReference $resource): ?OwnerReference
     {
         return match ($resource->id) {
-            'personal' => new OwnerReference(OwnerType::PERSON, $this->personalOwner),
-            'shared' => new OwnerReference(OwnerType::HOUSEHOLD, $scope->householdId),
+            'personal' => $this->allHouseholdOwned
+                ? new OwnerReference(OwnerType::WORKSPACE, $scope->workspaceId)
+                : new OwnerReference(OwnerType::PERSON, $this->personalOwner),
+            'shared' => new OwnerReference(OwnerType::WORKSPACE, $scope->workspaceId),
+            'third' => new OwnerReference(OwnerType::PERSON, 'carol'),
             default => null,
         };
     }
@@ -176,7 +192,8 @@ final class ApprovalHost implements ResourceAuthority, ResumptionContext, RuleEv
 
     public function approverFor(Scope $scope, ResourceReference $resource, OwnerReference $owner): ?string
     {
-        return $owner->type === OwnerType::PERSON ? $owner->id : $this->householdApprover;
+        return $this->approversByResource[$resource->id]
+            ?? ($owner->type === OwnerType::PERSON ? $owner->id : $this->householdApprover);
     }
 
     public function evaluate(Scope $scope, ResourceReference $resource, OwnerReference $owner, string $actionKey): RuleEvaluation

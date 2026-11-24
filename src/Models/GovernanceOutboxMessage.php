@@ -16,6 +16,7 @@ final class GovernanceOutboxMessage extends Model
     {
         return [
             'payload' => 'encrypted',
+            'is_group' => 'boolean',
             'delivered_at' => 'immutable_datetime',
         ];
     }

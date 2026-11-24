@@ -8,15 +8,17 @@ use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Storage;
 use Ocdejong\SharedToolGovernance\Activity\Activity;
 use Ocdejong\SharedToolGovernance\Approvals\ApprovalDecision;
 use Ocdejong\SharedToolGovernance\Approvals\Approvals;
-use Ocdejong\SharedToolGovernance\Authorization\Authorizer;
-use Ocdejong\SharedToolGovernance\Data\Invocation;
+use Ocdejong\SharedToolGovernance\Data\ExecutionStatus;
 use Ocdejong\SharedToolGovernance\Data\Verdict;
 use Ocdejong\SharedToolGovernance\Data\VerifiedReply;
 use Ocdejong\SharedToolGovernance\Discovery\DiscoveryMode;
 use Ocdejong\SharedToolGovernance\Discovery\ToolDiscovery;
+use Ocdejong\SharedToolGovernance\Governance;
+use Ocdejong\SharedToolGovernance\Jobs\DeliverCompletion;
 use Ocdejong\SharedToolGovernance\LocalInbox\LocalInbox;
 use Ocdejong\SharedToolGovernance\Tools\ToolRegistry;
 
@@ -47,15 +49,43 @@ function runDemo(string $phase): void
     $callId = TwoOwnerServiceProvider::CALL_ID;
     check(Http::preventingStrayRequests(), 'Stray HTTP must be blocked in the demo.');
 
+    if ($phase === 'revoke') {
+        check($cache->get('demo.executions') === 1
+            && $approvals->receipt($callId) === ['status' => 'granted', 'outcome' => 'success'],
+            'Expected a committed success before revoking access.');
+        $payload = json_decode((string) $jobs->sole()->payload, true, flags: JSON_THROW_ON_ERROR);
+        check($payload['displayName'] === DeliverCompletion::class, 'Expected a waiting completion job.');
+        $cache->put('demo.audience', ['Pauline']);
+
+        return;
+    }
+
+    if ($phase === 'verify-revoked') {
+        check($jobs->count() === 0 && DB::table('failed_jobs')->count() === 0, 'Expected the completion worker to finish.');
+        check($cache->get('demo.executions') === 1 && Storage::disk('local')->allFiles('completion-inbox') === [],
+            'An audience change must leave no inbox entry and must not repeat execution.');
+        echo 'Revoked audience received no inbox result. The executor ran once.'.PHP_EOL;
+
+        return;
+    }
+
     if ($phase === 'verify') {
         check($cache->get('demo.executions') === 1, 'Expected one executor call after the restart.');
         check($jobs->count() === 0 && DB::table('failed_jobs')->count() === 0, 'The worker left queued or failed jobs.');
         check(DB::table('governance_grants')->count() === 1
             && DB::table('governance_grants')->whereNotNull('redeemed_at')->count() === 1, 'Expected one redeemed grant.');
 
-        $suggestions = $cache->get('demo.model-result');
-        check($suggestions === ['suggestions' => ['10:00–10:30']], 'Expected only the shared suggestion in the model result.');
-        show('Model result', $suggestions);
+        $completion = $host->completion($callId);
+        if ($completion !== [
+            'status' => ExecutionStatus::SUCCEEDED->value,
+            'result' => ['suggestions' => ['10:00–10:30']],
+        ]) {
+            throw new RuntimeException('Expected one private inbox result with only the shared suggestion.');
+        }
+        show('Private completion for Tom', $completion);
+
+        $host->viewAs('Pauline');
+        check($host->completion($callId) === null, 'Pauline must not see the result in the requester inbox.');
 
         $activity = app(Activity::class);
         foreach (['Tom', 'Pauline'] as $viewer) {
@@ -82,7 +112,7 @@ function runDemo(string $phase): void
         return;
     }
 
-    check($phase === 'prepare', 'Expected prepare or verify.');
+    check($phase === 'prepare', 'Unknown demo phase.');
     $host->seedOwnerRules();
     $context = $host->current();
     $scope = $context->scope;
@@ -116,24 +146,16 @@ function runDemo(string $phase): void
     check($schema['required'] === ['date'] && array_keys($schema['properties']) === ['date']
         && ($schema['additionalProperties'] ?? null) === false, 'The tool schema must accept only the date. The reason belongs to the invocation.');
     $arguments = ['date' => $schema['properties']['date']['const']];
-    $request = new Invocation(
-        $callId,
-        $definition->name,
-        $definition->version,
-        $arguments,
-        REASON,
-        $context,
-        $definition->executorId,
-    );
     $cache->put('demo.request-context', [
-        'id' => $request->id,
+        'id' => $callId,
         'requester' => $context->requesterId,
         'runtime' => $context->runtimeId,
+        'audience' => $context->audience,
     ]);
-    $result = app(Authorizer::class)->authorize($request);
-    check($result->jsonSerialize() === ['status' => 'pending_approval', 'request_id' => $callId]
-        && $result->grantToken() === null, 'Expected an audience-safe pending response without a grant.');
-    show('Model status', $result->jsonSerialize());
+    $result = app(Governance::class)->call($callId, $definition->name, $definition->version, $arguments, REASON);
+    check($result === ['status' => 'pending_approval', 'call_id' => $callId, 'result' => null],
+        'Expected an audience-safe pending response.');
+    show('Model status', $result);
 
     check($jobs->count() === 1, 'Expected one queued card delivery.');
     check(Artisan::call('queue:work', ['--once' => true, '--queue' => 'default', '--tries' => 1]) === 0, 'Card delivery worker failed.');

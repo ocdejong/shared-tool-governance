@@ -6,6 +6,7 @@ namespace Ocdejong\SharedToolGovernance\Rules;
 
 use Illuminate\Database\Eloquent\Builder;
 use InvalidArgumentException;
+use Ocdejong\SharedToolGovernance\Authorization\ScopeAccess;
 use Ocdejong\SharedToolGovernance\Contracts\ResourceAuthority;
 use Ocdejong\SharedToolGovernance\Contracts\RuleEvaluator;
 use Ocdejong\SharedToolGovernance\Contracts\TrustedInvocationContext;
@@ -20,10 +21,14 @@ use Ocdejong\SharedToolGovernance\Models\GovernanceRuleRevision;
 
 final readonly class ResourceRules implements RuleEvaluator
 {
+    private ScopeAccess $access;
+
     public function __construct(
         private ResourceAuthority $authority,
         private TrustedInvocationContext $context,
-    ) {}
+    ) {
+        $this->access = new ScopeAccess($authority);
+    }
 
     public function evaluate(Scope $scope, ResourceReference $resource, OwnerReference $owner, string $actionKey): RuleEvaluation
     {
@@ -110,9 +115,7 @@ final readonly class ResourceRules implements RuleEvaluator
     {
         $context = $this->context->current();
         $requester = $context->requesterId;
-        if ($context->scope->hostScope !== $scope->hostScope
-            || $context->scope->householdId !== $scope->householdId
-            || ! $this->authority->isMember($scope, $requester)) {
+        if (! $this->access->allows($scope, $context->scope, $requester)) {
             throw new RuleAccessDenied('The requester cannot manage rules in this scope.');
         }
 
@@ -129,16 +132,8 @@ final readonly class ResourceRules implements RuleEvaluator
     private function currentOwner(Scope $scope, ResourceReference $resource): ?OwnerReference
     {
         $owner = $this->authority->ownerOf($scope, $resource);
-        if ($owner === null) {
-            return null;
-        }
 
-        $valid = match ($owner->type) {
-            OwnerType::PERSON => $this->authority->isMember($scope, $owner->id),
-            OwnerType::HOUSEHOLD => $owner->id === $scope->householdId,
-        };
-
-        return $valid ? $owner : null;
+        return $owner !== null && $this->access->includesOwner($scope, $owner) ? $owner : null;
     }
 
     /** @return array{host_scope: string, household_id: string, resource_type: string, resource_id: string} */
@@ -146,7 +141,7 @@ final readonly class ResourceRules implements RuleEvaluator
     {
         return [
             'host_scope' => $scope->hostScope,
-            'household_id' => $scope->householdId,
+            'household_id' => $scope->workspaceId,
             'resource_type' => $resource->type,
             'resource_id' => $resource->id,
         ];

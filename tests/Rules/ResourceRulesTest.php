@@ -64,7 +64,7 @@ it('uses a household rule only for the verified household owner', function (): v
         ->and($rules->getRules($scope, $resource)->evaluate('calendar.read')->verdict)->toBe(Verdict::DENY);
     $rules->setRules($scope, $resource, 0, ['rules' => ['calendar' => Verdict::DELEGATE]]);
 
-    expect($rules->evaluate($scope, $resource, new OwnerReference(OwnerType::HOUSEHOLD, 'home'), 'calendar.read')->verdict)->toBe(Verdict::DELEGATE)
+    expect($rules->evaluate($scope, $resource, new OwnerReference(OwnerType::WORKSPACE, 'home'), 'calendar.read')->verdict)->toBe(Verdict::DELEGATE)
         ->and($rules->evaluate($scope, $resource, new OwnerReference(OwnerType::PERSON, 'tom'), 'calendar.read')->verdict)->toBe(Verdict::DENY);
 
     $host->requester = 'pauline';

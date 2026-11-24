@@ -8,6 +8,8 @@ use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\DB;
 use Ocdejong\SharedToolGovernance\Activity\ActivityState;
 use Ocdejong\SharedToolGovernance\Approvals\ApprovalStore;
+use Ocdejong\SharedToolGovernance\Approvals\ApprovalUndeliverable;
+use Ocdejong\SharedToolGovernance\Configuration;
 use Ocdejong\SharedToolGovernance\Data\Invocation;
 use Ocdejong\SharedToolGovernance\Data\Verdict;
 use Ocdejong\SharedToolGovernance\Grants\GrantService;
@@ -27,7 +29,7 @@ final readonly class Authorizer
 
         $existing = $query->first();
         if ($existing !== null) {
-            return self::existingResult($existing, $invocation->id, $fingerprint);
+            return $this->existingResult($existing, $frozen, $fingerprint);
         }
 
         try {
@@ -35,7 +37,7 @@ final readonly class Authorizer
         } catch (UniqueConstraintViolationException $exception) {
             $existing = $query->first() ?? throw $exception;
 
-            return self::existingResult($existing, $invocation->id, $fingerprint);
+            return $this->existingResult($existing, $frozen, $fingerprint);
         }
     }
 
@@ -52,9 +54,10 @@ final readonly class Authorizer
         $requirements = $status === 'pending_approval' ? $this->policy->approvalRequirements($frozen, $decisions) : null;
         $call = $frozen->call;
         $context = $call->context;
+        $issuedAt = now();
         $row = GovernanceInvocation::query()->forceCreate([
             'host_scope' => $context->scope->hostScope,
-            'household_id' => $context->scope->householdId,
+            'household_id' => $context->scope->workspaceId,
             'invocation_id' => $call->id,
             'tool_name' => $call->toolName,
             'tool_version' => $call->toolVersion,
@@ -70,23 +73,38 @@ final readonly class Authorizer
             ],
             'fingerprint' => $fingerprint,
             'status' => $status,
+            'created_at' => $issuedAt,
+            'updated_at' => $issuedAt,
+            'approval_expires_at' => $status === 'pending_approval'
+                ? $issuedAt->copy()->addMinutes(Configuration::duration('approval_lifetime_minutes'))
+                : null,
         ]);
         $token = $status === 'granted' ? GrantService::issue($row) : null;
         InvocationStore::audit($row, $status);
         if ($requirements !== null) {
             ApprovalStore::stage($row, $frozen, $requirements);
             DB::afterCommit(static fn () => ApprovalWork::deliverFor((int) $row->getKey()));
+        } elseif ($status === 'pending_approval') {
+            InvocationStore::audit($row, 'approval_undeliverable');
+            event(new ApprovalUndeliverable($context->scope, $call->id));
         }
 
         return new AuthorizationResult($status, $call->id, $token);
     }
 
-    private static function existingResult(GovernanceInvocation $row, string $id, string $fingerprint): AuthorizationResult
+    private function existingResult(GovernanceInvocation $row, FrozenCall $frozen, string $fingerprint): AuthorizationResult
     {
+        $id = $frozen->call->id;
+        if (! $this->policy->allowsParticipants($frozen)) {
+            return new AuthorizationResult('denied', $id);
+        }
+
         if ($row->getAttribute('fingerprint') !== $fingerprint) {
             throw new InvocationConflict('Invocation ID is already bound to a different call.');
         }
 
-        return new AuthorizationResult(ActivityState::read($row, now())->status, $id);
+        $state = ActivityState::read($row, now());
+
+        return new AuthorizationResult($state->status, $id, executionOutcome: $state->outcome);
     }
 }
