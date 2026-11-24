@@ -3,10 +3,15 @@
 declare(strict_types=1);
 
 use App\Providers\PermissionTreeServiceProvider as Host;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Ocdejong\SharedToolGovernance\Contracts\RuleEvaluator;
+use Ocdejong\SharedToolGovernance\Data\OwnerReference;
+use Ocdejong\SharedToolGovernance\Data\OwnerType;
 use Ocdejong\SharedToolGovernance\Data\ResourceReference;
+use Ocdejong\SharedToolGovernance\Data\RuleEvaluation;
 use Ocdejong\SharedToolGovernance\Data\Scope;
 use Ocdejong\SharedToolGovernance\Data\ToolDefinition;
 use Ocdejong\SharedToolGovernance\Data\Verdict;
@@ -31,7 +36,7 @@ beforeEach(function (): void {
 
 /**
  * @param  list<PermissionNode>  $nodes
- * @return array<string, PermissionNode>
+ * @return array<array-key, PermissionNode>
  */
 function permissionNodes(array $nodes): array
 {
@@ -279,4 +284,171 @@ it('returns an empty tree when no tools are registered', function (): void {
     app()->instance(ToolRegistry::class, new ToolRegistry);
     $snapshot = app(PermissionTree::class)->read(app(Host::class)->current()->scope, new ResourceReference('calendar', 'pauline'));
     expect($snapshot->nodes)->toBe([])->and($snapshot->revision)->toBe(0)->and($snapshot->enabled)->toBeTrue();
+});
+
+it('uses the configured policy for both saved and freshly read snapshots and dispatch', function (Verdict $saved, Verdict $effective, string $status): void {
+    $host = app(Host::class);
+    $scope = $host->current()->scope;
+    $resource = new ResourceReference('calendar', 'pauline');
+    $owner = new OwnerReference(OwnerType::PERSON, 'pauline');
+    app(PermissionTree::class)->update($scope, $resource, 0, ['rules' => ['calendar.events.reschedule' => $saved]]);
+    $this->mock(RuleEvaluator::class)->shouldReceive('evaluate')
+        ->withArgs(static fn (Scope $actualScope, ResourceReference $actualResource, OwnerReference $actualOwner, string $action): bool => $actualScope->equals($scope) && $actualResource == $resource && $actualOwner == $owner
+            && in_array($action, ['calendar', 'calendar.availability', 'calendar.events', 'calendar.events.delete', 'calendar.events.reschedule'], true))
+        ->andReturn(new RuleEvaluation($effective, null, 999, 'Host policy decides this permission.'));
+
+    $tree = app(PermissionTree::class);
+    $updated = $tree->update($scope, $resource, 1, ['rules' => ['calendar.events.reschedule' => $saved]]);
+    foreach ([$updated, $tree->read($scope, $resource)] as $snapshot) {
+        $node = permissionNodes($snapshot->nodes)['calendar.events.reschedule'];
+        expect($snapshot->revision)->toBe(2)
+            ->and($node->explicitSetting)->toBe($saved)
+            ->and($node->effectiveVerdict)->toBe($effective)
+            ->and($node->explanation)->toBe('Host policy decides this permission.')
+            ->and($node->sourceKey)->toBeNull()
+            ->and($node->source->value)->toBe('host_policy');
+    }
+    expect(DB::table('governance_invocations')->count())->toBe(0)
+        ->and(DB::table('governance_grants')->count())->toBe(0)
+        ->and($host->executions)->toBe(0);
+
+    expect(app(Governance::class)->call('host-policy', 'reschedule', '1', ['calendar' => 'pauline', 'time' => '14:30'], 'Move the visit.')['status'])->toBe($status)
+        ->and($host->executions)->toBe($effective === Verdict::ALLOW ? 1 : 0);
+})->with([
+    'saved allow and host deny' => [Verdict::ALLOW, Verdict::DENY, 'denied'],
+    'saved deny and host allow without a matched key' => [Verdict::DENY, Verdict::ALLOW, 'success'],
+]);
+
+it('reads a numeric permission parent as a literal string', function (): void {
+    registerPermission('numeric_calendar', '1', '365.calendar');
+    $snapshot = app(PermissionTree::class)->read(app(Host::class)->current()->scope, new ResourceReference('calendar', 'pauline'));
+    $parent = permissionNodes($snapshot->nodes)['365'];
+    expect($parent->key)->toBe('365')->and($parent->children[0]->key)->toBe('365.calendar');
+});
+
+it('saves a numeric parent rule through resource management', function (): void {
+    $scope = app(Host::class)->current()->scope;
+    $resource = new ResourceReference('calendar', 'pauline');
+    app(ResourceRules::class)->setRules($scope, $resource, 0, ['rules' => ['365' => Verdict::DELEGATE]]);
+    $reloaded = app(ResourceRules::class)->getRules($scope, $resource);
+    expect($reloaded->revision)->toBe(1)
+        ->and($reloaded->evaluate('365.calendar')->verdict)->toBe(Verdict::DELEGATE);
+});
+
+it('round trips numeric paths through tree edits, storage, inheritance and JSON', function (string $parent): void {
+    $child = $parent.'.calendar';
+    registerPermission('numeric_calendar', '1', $child);
+    if ($parent === '0') {
+        registerPermission('zero_root', '1', '0');
+    }
+    $scope = app(Host::class)->current()->scope;
+    $resource = new ResourceReference('calendar', 'pauline');
+    $snapshot = app(PermissionTree::class)->read($scope, $resource);
+    $nodes = permissionNodes($snapshot->nodes);
+    expect($snapshot->revision)->toBe(0)
+        ->and($nodes[$parent]->key)->toBe($parent)
+        ->and($nodes[$child]->key)->toBe($child);
+
+    $edits = [
+        [['rules' => [$parent => Verdict::DELEGATE]], Verdict::DELEGATE, PermissionSource::INHERITED, $parent],
+        [['rules' => [$child => Verdict::ALLOW]], Verdict::ALLOW, PermissionSource::EXPLICIT, $child],
+        [['rules' => [$child => null]], Verdict::DELEGATE, PermissionSource::INHERITED, $parent],
+        [['rules' => [$parent => null]], Verdict::DENY, PermissionSource::DEFAULT_DENY, null],
+    ];
+    foreach ($edits as $index => [$changes, $verdict, $source, $sourceKey]) {
+        $saved = app(PermissionTree::class)->update($scope, $resource, $snapshot->revision, $changes);
+        $snapshot = app(PermissionTree::class)->read($scope, $resource);
+        $nodes = permissionNodes($snapshot->nodes);
+        expect($snapshot)->toEqual($saved)
+            ->and($snapshot->revision)->toBe($index + 1)
+            ->and($nodes[$parent]->key)->toBe($parent)
+            ->and($nodes[$child]->effectiveVerdict)->toBe($verdict)
+            ->and($nodes[$child]->source)->toBe($source)
+            ->and($nodes[$child]->sourceKey)->toBe($sourceKey)
+            ->and(DB::table('governance_rule_revisions')->count())->toBe($index + 1);
+
+        $json = json_decode(json_encode($snapshot, JSON_THROW_ON_ERROR), true, flags: JSON_THROW_ON_ERROR);
+        $jsonParent = array_values(array_filter($json['nodes'], static fn (array $node): bool => $node['key'] === $parent))[0];
+        expect($jsonParent['key'])->toBe($parent)
+            ->and($jsonParent['children'][0]['key'])->toBe($child);
+
+        if ($index === 0) {
+            $stored = DB::table('governance_rule_revisions')->orderByDesc('revision')->value('rules');
+            expect($stored)->toBeString()->toContain('"'.$parent.'"');
+        }
+    }
+
+    expect(fn () => app(PermissionTree::class)->update($scope, $resource, $snapshot->revision, ['rules' => [$parent => Verdict::ALLOW, 'bad..key' => Verdict::DENY]]))
+        ->toThrow(InvalidArgumentException::class)
+        ->and(app(PermissionTree::class)->read($scope, $resource))->toEqual($snapshot)
+        ->and(app(ResourceRules::class)->getRules($scope, $resource)->rules)->toBe([])
+        ->and(DB::table('governance_rule_revisions')->count())->toBe(4);
+})->with(['365', '0']);
+
+it('rolls back the edit if the configured policy cannot build its returned snapshot', function (bool $existing): void {
+    $scope = app(Host::class)->current()->scope;
+    $resource = new ResourceReference('calendar', 'pauline');
+    if ($existing) {
+        app(PermissionTree::class)->update($scope, $resource, 0, ['rules' => ['calendar' => Verdict::ALLOW]]);
+    }
+    $previous = app(PermissionTree::class)->read($scope, $resource);
+    $this->mock(RuleEvaluator::class)->shouldReceive('evaluate')->once()->andThrow(new RuntimeException('Host policy unavailable.'));
+
+    expect(fn () => app(PermissionTree::class)->update($scope, $resource, $previous->revision, ['rules' => ['calendar' => Verdict::DENY]]))
+        ->toThrow(RuntimeException::class, 'Host policy unavailable.');
+
+    app()->instance(RuleEvaluator::class, app(ResourceRules::class));
+    expect(app(PermissionTree::class)->read($scope, $resource))->toEqual($previous)
+        ->and(DB::table('governance_rule_revisions')->count())->toBe($existing ? 1 : 0)
+        ->and(DB::table('governance_resource_bindings')->count())->toBe($existing ? 1 : 0);
+})->with([false, true]);
+
+it('keeps custom policy results behind resource management authorization', function (): void {
+    $scope = app(Host::class)->current()->scope;
+    $resource = new ResourceReference('calendar', 'pauline');
+    app(Host::class)->viewer = 'tom';
+    $this->mock(RuleEvaluator::class)->shouldNotReceive('evaluate');
+
+    expect(fn () => app(PermissionTree::class)->read($scope, $resource))->toThrow(RuleAccessDenied::class)
+        ->and(fn () => app(PermissionTree::class)->update($scope, $resource, 0, ['rules' => ['calendar' => Verdict::ALLOW]]))->toThrow(RuleAccessDenied::class)
+        ->and(DB::table('governance_rule_revisions')->count())->toBe(0);
+});
+
+it('uses the custom matched key to identify sources independently of the saved off switch', function (?string $matched, PermissionSource $source): void {
+    $scope = app(Host::class)->current()->scope;
+    $resource = new ResourceReference('calendar', 'pauline');
+    $this->mock(RuleEvaluator::class)->shouldReceive('evaluate')->andReturn(new RuleEvaluation(Verdict::ALLOW, $matched, null, 'Host policy allows this resource.'));
+    $tree = app(PermissionTree::class);
+    $updated = $tree->update($scope, $resource, 0, ['enabled' => false]);
+
+    foreach ([$updated, $tree->read($scope, $resource)] as $snapshot) {
+        $node = permissionNodes($snapshot->nodes)['calendar.events.reschedule'];
+        expect($snapshot->enabled)->toBeFalse()
+            ->and($node->explicitSetting)->toBeNull()
+            ->and($node->effectiveVerdict)->toBe(Verdict::ALLOW)
+            ->and($node->source)->toBe($source)
+            ->and($node->sourceKey)->toBe($matched);
+    }
+})->with([
+    'exact policy key' => ['calendar.events.reschedule', PermissionSource::EXPLICIT],
+    'ancestor policy key' => ['calendar', PermissionSource::INHERITED],
+    'no policy key' => [null, PermissionSource::HOST_POLICY],
+]);
+
+it('loads the built in settings once per read or update regardless of the number of nodes', function (): void {
+    $scope = app(Host::class)->current()->scope;
+    $resource = new ResourceReference('calendar', 'pauline');
+    $tree = app(PermissionTree::class);
+    $tree->update($scope, $resource, 0, ['rules' => ['calendar' => Verdict::ALLOW]]);
+    $reads = 0;
+    DB::listen(static function (QueryExecuted $query) use (&$reads): void {
+        if (str_starts_with($query->sql, 'select') && str_contains($query->sql, 'governance_rule_revisions')) {
+            $reads++;
+        }
+    });
+
+    $tree->read($scope, $resource);
+    expect($reads)->toBe(1);
+    $tree->update($scope, $resource, 1, ['rules' => ['calendar' => Verdict::DELEGATE]]);
+    expect($reads)->toBe(2);
 });
