@@ -23,11 +23,15 @@ php artisan migrate
 
 Laravel discovers the service provider and its migrations automatically. The migrations add `governance_*` tables to the application's database.
 
+Follow the [host integration guide](docs/integration.md) to register tools, connect private approvals and run the queue worker. The [two-owner example](examples/two-owner) shows those bindings in a Laravel service provider.
+
 ## Smoke-test a clean consumer
 
 From a Git checkout of this repository, run `bin/consumer-smoke` to test `HEAD`, or pass a commit with `bin/consumer-smoke <commit>`. You need Bash, Git, Composer, PHP with PDO SQLite and Composer access to Laravel's dependencies. The checkout must contain the seam commit `b4ceea1`.
 
 The script creates a temporary Laravel 13 app with SQLite and the database queue. Composer installs the archived package revisions through a path repository. The script checks provider discovery, migration and rollback over seeded host data, and the upgrade from `b4ceea1` with existing governance data. It prints the runtime versions on success and removes the temporary app and databases on exit.
+
+Run `bin/consumer-smoke --demo HEAD` to also run the two-owner example in that clean app. It discovers permissions for two calendars, delivers one private approval card, then starts a fresh queue worker to execute the approved call once and verify both owners' receipts. The example uses synthetic calendars and a local inbox and blocks outbound HTTP.
 
 ## License
 

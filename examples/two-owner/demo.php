@@ -18,6 +18,7 @@ use Ocdejong\SharedToolGovernance\Data\VerifiedReply;
 use Ocdejong\SharedToolGovernance\Discovery\DiscoveryMode;
 use Ocdejong\SharedToolGovernance\Discovery\ToolDiscovery;
 use Ocdejong\SharedToolGovernance\LocalInbox\LocalInbox;
+use Ocdejong\SharedToolGovernance\Tools\ToolRegistry;
 
 const REASON = 'Find a time for our planning call.';
 
@@ -110,14 +111,19 @@ function runDemo(string $phase): void
         && $cache->get('demo.executions') === 0, 'Discovery produced a grant, message or executor call.');
     show('MATCH', $permissions);
 
+    $definition = app(ToolRegistry::class)->get('joint_availability', '1');
+    $schema = $definition->inputSchema;
+    check($schema['required'] === ['date'] && array_keys($schema['properties']) === ['date']
+        && ($schema['additionalProperties'] ?? null) === false, 'The tool schema must accept only the date. The reason belongs to the invocation.');
+    $arguments = ['date' => $schema['properties']['date']['const']];
     $request = new Invocation(
         $callId,
-        'joint_availability',
-        '1',
-        ['date' => '2026-12-02'],
+        $definition->name,
+        $definition->version,
+        $arguments,
         REASON,
         $context,
-        TwoOwnerServiceProvider::class,
+        $definition->executorId,
     );
     $cache->put('demo.request-context', [
         'id' => $request->id,

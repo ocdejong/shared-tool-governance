@@ -172,8 +172,9 @@ final class TwoOwnerServiceProvider extends ServiceProvider implements ResourceA
             actionKey: $action,
             inputSchema: [
                 'type' => 'object',
-                'properties' => ['date' => ['type' => 'string', 'format' => 'date'], 'reason' => ['type' => 'string']],
-                'required' => ['date', 'reason'],
+                'properties' => ['date' => ['type' => 'string', 'format' => 'date', 'const' => self::DATE]],
+                'required' => ['date'],
+                'additionalProperties' => false,
             ],
             normalizeArguments: static function (array $arguments): array {
                 if ($arguments !== ['date' => self::DATE]) {
