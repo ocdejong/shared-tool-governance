@@ -8,6 +8,9 @@ use Ocdejong\SharedToolGovernance\Data\Scope;
 
 interface ApprovalNotifier
 {
-    /** Return the original card ID on retries of the same delivery ID. */
+    /**
+     * Deliver privately. Preserve the delivery ID as the approval ID for replies.
+     * Return the original card ID on retries of the same delivery ID.
+     */
     public function deliver(Scope $scope, string $deliveryId, string $recipientId, string $message): string;
 }

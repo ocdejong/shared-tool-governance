@@ -6,10 +6,12 @@ namespace Ocdejong\SharedToolGovernance\Authorization;
 
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\DB;
+use Ocdejong\SharedToolGovernance\Approvals\ApprovalStore;
 use Ocdejong\SharedToolGovernance\Data\Invocation;
 use Ocdejong\SharedToolGovernance\Data\Verdict;
 use Ocdejong\SharedToolGovernance\Grants\GrantService;
 use Ocdejong\SharedToolGovernance\Models\GovernanceInvocation;
+use Ocdejong\SharedToolGovernance\Outbox\ApprovalWork;
 
 final readonly class Authorizer
 {
@@ -46,6 +48,7 @@ final readonly class Authorizer
             default => 'granted',
         };
 
+        $requirements = $status === 'pending_approval' ? $this->policy->approvalRequirements($frozen, $decisions) : null;
         $call = $frozen->call;
         $context = $call->context;
         $row = GovernanceInvocation::query()->forceCreate([
@@ -60,12 +63,16 @@ final readonly class Authorizer
             'executor_id' => $call->executorId,
             'reason' => $call->reason,
             'audience' => $context->audience,
-            'frozen_inputs' => $frozen->inputs() + ['decisions' => $decisions],
+            'frozen_inputs' => $frozen->inputs() + ['decisions' => $decisions, 'approval_requirements' => $requirements],
             'fingerprint' => $fingerprint,
             'status' => $status,
         ]);
         $token = $status === 'granted' ? GrantService::issue($row) : null;
         InvocationStore::audit($row, $status);
+        if ($requirements !== null) {
+            ApprovalStore::stage($row, $frozen, $requirements);
+            DB::afterCommit(static fn () => ApprovalWork::deliverFor((int) $row->getKey()));
+        }
 
         return new AuthorizationResult($status, $call->id, $token);
     }

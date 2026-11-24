@@ -10,4 +10,9 @@ final readonly class Scope
         public string $hostScope,
         public string $householdId,
     ) {}
+
+    public function equals(self $other): bool
+    {
+        return $this->hostScope === $other->hostScope && $this->householdId === $other->householdId;
+    }
 }

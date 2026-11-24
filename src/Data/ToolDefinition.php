@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Ocdejong\SharedToolGovernance\Data;
 
 use Closure;
+use Ocdejong\SharedToolGovernance\Approvals\ApprovalPreview;
 
 final readonly class ToolDefinition
 {
@@ -13,6 +14,7 @@ final readonly class ToolDefinition
      * @param  Closure(array<string, mixed>, InvocationContext): array<string, mixed>  $normalizeArguments
      * @param  Closure(array<string, mixed>, InvocationContext): list<ResourceReference>  $resolveTargets
      * @param  array<string, mixed>  $resultSchema
+     * @param  (Closure(Invocation, list<ResourceReference>, string): ?ApprovalPreview)|null  $approvalPreview
      */
     public function __construct(
         public string $name,
@@ -24,5 +26,6 @@ final readonly class ToolDefinition
         public string $executorId,
         public string $effect,
         public array $resultSchema,
+        public ?Closure $approvalPreview = null,
     ) {}
 }
