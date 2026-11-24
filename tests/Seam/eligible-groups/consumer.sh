@@ -73,6 +73,7 @@ php -r '
     }
 '
 cp "$fixture/consumer.php" ./eligible-groups.php
+cp "$fixture/GroupChat.php" "$fixture/group-scenarios.php" .
 install_package() {
     local stage=$1
     local version="dev-groups-$stage-${!stage}"
@@ -91,12 +92,12 @@ php eligible-groups.php worker
 php eligible-groups.php verify-upgrade
 echo "Upgrade passed ($driver): separate owners and a single approver completed, combined legacy card expired."
 
-if [[ $driver == pgsql ]]; then
-    php eligible-groups.php prepare-races
-    php eligible-groups.php group-worker
-    php eligible-groups.php race
-    php eligible-groups.php group-worker
-    php eligible-groups.php group-worker
-    php eligible-groups.php verify-races
-    echo 'PostgreSQL races passed: opposite decisions and duplicate replies settled once, with a fresh worker.'
-fi
+php eligible-groups.php prepare-groups
+php eligible-groups.php group-delivery-worker
+php eligible-groups.php group-replies
+php eligible-groups.php race-group-replies
+php eligible-groups.php race-resumers
+php eligible-groups.php group-worker
+php eligible-groups.php group-worker
+php eligible-groups.php verify-groups
+echo "Group prompts passed ($driver): disclosure, binding, first decision, retry, and concurrent replies and workers."
