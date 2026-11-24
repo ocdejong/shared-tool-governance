@@ -24,8 +24,13 @@ final readonly class ApprovalPolicy
     {
         $scope = ApprovalStore::scope($row);
         $inputs = $row->getAttribute('frozen_inputs');
+        $reason = $inputs['reason'] ?? null;
+        if (! is_string($reason) || ! isset($inputs['arguments_json'], $inputs['approval_requirements'])) {
+            return null;
+        }
+
         $live = $this->host->forInvocation($scope, $row->getAttribute('invocation_id'));
-        if ($live === null || ! isset($inputs['arguments_json'], $inputs['approval_requirements'])) {
+        if ($live === null) {
             return null;
         }
 
@@ -34,7 +39,7 @@ final readonly class ApprovalPolicy
             $row->getAttribute('tool_name'),
             $row->getAttribute('tool_version'),
             json_decode($inputs['arguments_json'], true, flags: JSON_THROW_ON_ERROR),
-            $row->getAttribute('reason'),
+            $reason,
             new InvocationContext($scope, $row->getAttribute('requester_id'), $row->getAttribute('runtime_id'), $row->getAttribute('audience')),
             $row->getAttribute('executor_id'),
         );

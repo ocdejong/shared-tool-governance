@@ -61,9 +61,12 @@ final readonly class Authorizer
             'requester_id' => $context->requesterId,
             'runtime_id' => $context->runtimeId,
             'executor_id' => $call->executorId,
-            'reason' => $call->reason,
             'audience' => $context->audience,
-            'frozen_inputs' => $frozen->inputs() + ['decisions' => $decisions, 'approval_requirements' => $requirements],
+            'frozen_inputs' => $frozen->inputs() + [
+                'reason' => $call->reason,
+                'decisions' => $decisions,
+                'approval_requirements' => $requirements,
+            ],
             'fingerprint' => $fingerprint,
             'status' => $status,
         ]);

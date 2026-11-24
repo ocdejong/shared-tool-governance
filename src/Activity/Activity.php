@@ -13,12 +13,14 @@ use Ocdejong\SharedToolGovernance\Contracts\TrustedInvocationContext;
 use Ocdejong\SharedToolGovernance\Data\InvocationContext;
 use Ocdejong\SharedToolGovernance\Data\OwnerType;
 use Ocdejong\SharedToolGovernance\Data\ResourceReference;
+use Ocdejong\SharedToolGovernance\Data\Verdict;
 use Ocdejong\SharedToolGovernance\Models\GovernanceInvocation;
 
 /**
  * @phpstan-import-type Target from ReceiptTargets
  *
- * @phpstan-type Receipt array{status: string, outcome?: string, invocation_id?: string, action?: string, requested_at?: string, targets?: list<array{id: string, type: string, account_alias: string|null, verdict: string, rule_key: string|null, rule_revision: int|null}>}
+ * @phpstan-type Approval array{approver_id: string, decision: string, decided_at: string}
+ * @phpstan-type Receipt array{status: string, outcome?: string, requester_id: string, approvals: list<Approval>, reason?: string, invocation_id?: string, action?: string, requested_at?: string, targets?: list<array{id: string, type: string, account_alias: string|null, verdict: string, rule_key: string|null, rule_revision: int|null}>}
  */
 final readonly class Activity
 {
@@ -129,8 +131,13 @@ final readonly class Activity
             $receipt['outcome'] = $state->outcome->value;
         }
 
+        $receipt['requester_id'] = $row->getAttribute('requester_id');
+        $receipt['approvals'] = self::decidedApprovals($row, $isRequester ? null : $targets);
+
         if ($isRequester) {
-            return $receipt;
+            $reason = $row->getAttribute('frozen_inputs')['reason'] ?? null;
+
+            return is_string($reason) ? $receipt + ['reason' => $reason] : $receipt;
         }
 
         return $receipt + [
@@ -146,6 +153,43 @@ final readonly class Activity
                 'rule_revision' => $target['rule_revision'],
             ], $targets),
         ];
+    }
+
+    /**
+     * @param  list<Target>|null  $targets
+     * @return list<Approval>
+     */
+    private static function decidedApprovals(GovernanceInvocation $row, ?array $targets): array
+    {
+        $owners = [];
+        foreach ($targets ?? [] as $target) {
+            if ($target['verdict'] === Verdict::DELEGATE->value) {
+                $owners[$target['owner_type']][$target['owner_id']] = true;
+            }
+        }
+
+        if ($targets !== null && $owners === []) {
+            return [];
+        }
+
+        $query = ApprovalStore::approvals($row);
+        $query->getQuery()->whereNotNull('decision')->whereNotNull('decided_at')
+            ->orderBy('decided_at')->orderBy('id')->useWritePdo();
+
+        $decisions = [];
+        foreach ($query->get(['owner_type', 'owner_id', 'approver_id', 'decision', 'decided_at']) as $approval) {
+            if ($targets !== null && ! isset($owners[$approval->getAttribute('owner_type')->value][$approval->getAttribute('owner_id')])) {
+                continue;
+            }
+
+            $decisions[] = [
+                'approver_id' => $approval->getAttribute('approver_id'),
+                'decision' => $approval->getAttribute('decision'),
+                'decided_at' => $approval->getAttribute('decided_at')->toIso8601String(),
+            ];
+        }
+
+        return $decisions;
     }
 
     /** @return list<Target> */

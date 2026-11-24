@@ -33,7 +33,6 @@ function fixtureInvocation(array $overrides = []): GovernanceInvocation
         'requester_id' => 'person-1',
         'runtime_id' => 'assistant-1',
         'executor_id' => 'items-worker',
-        'reason' => 'Move the repair visit',
         'audience' => ['person-1'],
         'fingerprint' => hash('sha256', 'fixture'),
         'status' => 'pending_approval',
