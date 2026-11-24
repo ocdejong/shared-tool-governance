@@ -32,8 +32,7 @@ use Ocdejong\SharedToolGovernance\Tests\Approvals\ApprovalHost;
 beforeEach(function (): void {
     expect(Artisan::call('migrate'))->toBe(0, Artisan::output());
     $this->beforeApplicationDestroyed(function (): void {
-        GovernanceApproval::query()->delete();
-        expect(Artisan::call('migrate:rollback'))->toBe(0, Artisan::output());
+        expect(Artisan::call('db:wipe', ['--force' => true]))->toBe(0, Artisan::output());
     });
     Queue::fake();
 });

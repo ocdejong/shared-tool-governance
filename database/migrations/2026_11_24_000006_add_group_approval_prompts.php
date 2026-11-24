@@ -4,7 +4,9 @@ declare(strict_types=1);
 
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use Ocdejong\SharedToolGovernance\Database\ApprovalRollback;
 
 return new class extends Migration
 {
@@ -20,6 +22,8 @@ return new class extends Migration
 
     public function down(): void
     {
+        ApprovalRollback::withoutGroupPrompts(DB::connection());
+
         Schema::table('governance_approvals', function (Blueprint $table): void {
             $table->dropIndex(['group_delivery_id']);
             $table->dropColumn('group_delivery_id');

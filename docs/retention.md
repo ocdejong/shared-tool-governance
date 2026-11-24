@@ -17,6 +17,15 @@ Fresh installations can run the full migration set. For an existing installation
 
 Rolling back the drop restores retained reasons to a nullable plaintext column, including reasons for calls that are still pending. Already-pruned reasons stay deleted. The new runtime continues to work with the restored schema. If you also roll back the application, keep approval processing on compatible workers until the older runtime takes over authorization and any calls created during the rollback have a restored reason or have reached a terminal state.
 
+## Rolling back approval migrations
+
+Before running `php artisan migrate:rollback`, stop incoming governance calls and replies, and pause approval delivery, resumption, recovery, and pruning workers. Wait for in-flight governance work to finish and keep pending jobs queued. Run the rollback using the current package files and Laravel's default migrator. The package checks the selected migrations before Artisan changes the schema or migration ledger. A custom migrator needs its own batch preflight. The individual migrations still check the evidence they would remove.
+
+- Migration 000006 stores shared approval card bindings. Rolling it back requires that no shared card bindings remain in the approval or outbox history. Private cards can stay when 000005 stays applied.
+- Migration 000005 stores approval modes and permits multiple voters for one owner on a call. Rolling it back requires that every retained approval has legacy semantics and fits the old one-approval-per-invocation-and-owner key. Legacy single-owner and separate named-owner approvals can survive a rollback and re-upgrade.
+
+These checks include pending and terminal calls. If Artisan refuses the rollback, keep the current schema and resume traffic with the compatible application and workers. Keep the consent rows and card bindings for receipts and replies. If the rollback succeeds, hand authorization and approval processing over together to application code and workers that support the resulting schema before resuming traffic. The reason rollback rules above still apply.
+
 ## Pruning
 
 The Laravel scheduler runs `php artisan shared-tool-governance:prune` daily when the host runs `schedule:run` or `schedule:work`. You can also run the command manually.

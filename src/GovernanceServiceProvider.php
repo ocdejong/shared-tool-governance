@@ -6,11 +6,13 @@ namespace Ocdejong\SharedToolGovernance;
 
 use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Contracts\Container\Container;
+use Illuminate\Database\Migrations\Migrator;
 use Illuminate\Support\ServiceProvider;
 use Ocdejong\SharedToolGovernance\Console\PruneGovernanceActivity;
 use Ocdejong\SharedToolGovernance\Contracts\ResourceAuthority;
 use Ocdejong\SharedToolGovernance\Contracts\RuleEvaluator;
 use Ocdejong\SharedToolGovernance\Contracts\TrustedInvocationContext;
+use Ocdejong\SharedToolGovernance\Database\GovernanceMigrator;
 use Ocdejong\SharedToolGovernance\Discovery\ToolDiscovery;
 use Ocdejong\SharedToolGovernance\Outbox\ApprovalWork;
 use Ocdejong\SharedToolGovernance\Rules\ResourceRules;
@@ -20,6 +22,18 @@ final class GovernanceServiceProvider extends ServiceProvider
 {
     public function register(): void
     {
+        $this->app->extend('migrator', static function (Migrator $migrator, Container $app): Migrator {
+            if ($migrator::class !== Migrator::class) {
+                return $migrator;
+            }
+
+            $guarded = new GovernanceMigrator($migrator->getRepository(), $app->make('db'), $app->make('files'), $app->make('events'));
+            foreach ($migrator->paths() as $path) {
+                $guarded->path($path);
+            }
+
+            return $guarded;
+        });
         $this->mergeConfigFrom(__DIR__.'/../config/shared-tool-governance.php', 'shared-tool-governance');
         $this->app->bindIf(RuleEvaluator::class, ResourceRules::class);
         $this->app->singletonIf(ToolRegistry::class);
