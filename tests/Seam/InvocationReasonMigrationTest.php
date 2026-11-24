@@ -137,7 +137,9 @@ it('upgrades pre-change reasons, preserves pending approval and restores only re
         ->and(DB::table('governance_invocations')->where('invocation_id', 'pruned')->value('frozen_inputs'))->toBeNull()
         ->and(DB::table('governance_invocations')->where('invocation_id', 'terminal')->value('frozen_inputs'))->not->toContain('Legacy terminal reason');
 
-    expect(Artisan::call('migrate:rollback', ['--step' => 1]))->toBe(0, Artisan::output())
+    expect(Artisan::call('migrate:rollback', ['--realpath' => true, '--path' => [
+        $directory.'/2026_11_24_000003_move_invocation_reason_into_frozen_inputs.php',
+    ]]))->toBe(0, Artisan::output())
         ->and(DB::table('governance_invocations')->orderBy('id')->pluck('reason', 'invocation_id')->all())->toBe([
             'legacy-window' => $pending->call->reason,
             'pending' => $pending->call->reason,

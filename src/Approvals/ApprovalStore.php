@@ -7,10 +7,12 @@ namespace Ocdejong\SharedToolGovernance\Approvals;
 use Carbon\CarbonInterface;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\App;
 use Illuminate\Support\Str;
 use Ocdejong\SharedToolGovernance\Authorization\CallPolicy;
 use Ocdejong\SharedToolGovernance\Authorization\FrozenCall;
 use Ocdejong\SharedToolGovernance\Authorization\InvocationStore;
+use Ocdejong\SharedToolGovernance\Contracts\GroupApprovalChannel;
 use Ocdejong\SharedToolGovernance\Data\ApprovalMode;
 use Ocdejong\SharedToolGovernance\Data\Scope;
 use Ocdejong\SharedToolGovernance\Models\GovernanceApproval;
@@ -27,9 +29,7 @@ final class ApprovalStore
     {
         $call = $frozen->call;
         $previewFor = $frozen->tool->approvalPreview;
-        if ($previewFor === null) {
-            throw new ApprovalSetupError($call->id, 'The delegated tool has no approval preview callback.');
-        }
+        $channel = App::bound(GroupApprovalChannel::class) ? App::make(GroupApprovalChannel::class) : null;
 
         $expires = self::expiresAt($row);
         $targetsByOwner = [];
@@ -41,7 +41,27 @@ final class ApprovalStore
         }
 
         foreach ($owners as $key => $owner) {
-            foreach ($owner['effective_people'] ?? $owner['eligible_people'] ?? [$owner['approver_id']] as $person) {
+            $people = $owner['effective_people'] ?? $owner['eligible_people'] ?? [$owner['approver_id']];
+            $prompt = ($owner['mode'] ?? null) === ApprovalMode::ANY->value
+                ? $channel?->promptFor($call, $targetsByOwner[$key], $people)
+                : null;
+            if ($prompt !== null) {
+                if (Str::trim($prompt->chatId) === '' || Str::trim($prompt->preview) === '') {
+                    throw new ApprovalSetupError($call->id, 'A group approval prompt requires a chat ID and preview.');
+                }
+
+                $deliveryId = self::stageDelivery($row, $prompt->chatId, $prompt->preview, ['is_group' => true]);
+                foreach ($people as $person) {
+                    self::stageVoter($row, $owner, $person, (string) Str::ulid(), ['group_delivery_id' => $deliveryId]);
+                }
+
+                continue;
+            }
+
+            if ($previewFor === null) {
+                throw new ApprovalSetupError($call->id, 'The delegated tool has no approval preview callback.');
+            }
+            foreach ($people as $person) {
                 $preview = $previewFor($call, $targetsByOwner[$key], $person);
                 if ($preview === null) {
                     throw new ApprovalSetupError($call->id, 'The approval preview callback returned null.');
@@ -50,15 +70,19 @@ final class ApprovalStore
                     throw new ApprovalSetupError($call->id, 'The approval preview requires text in both the reason and the scope and change fields.');
                 }
 
-                self::stageCard($row, $owner, $person, self::render($frozen, $preview, $expires));
+                $message = self::render($frozen, $preview, $expires);
+                $deliveryId = self::stageDelivery($row, $person, $message);
+                self::stageVoter($row, $owner, $person, $deliveryId, ['preview' => $message]);
             }
         }
     }
 
-    /** @param Requirement $owner */
-    private static function stageCard(GovernanceInvocation $row, array $owner, string $person, string $message): void
+    /**
+     * @param  Requirement  $owner
+     * @param  array{preview?: string, group_delivery_id?: string}  $delivery
+     */
+    private static function stageVoter(GovernanceInvocation $row, array $owner, string $person, string $id, array $delivery): void
     {
-        $id = (string) Str::ulid();
         GovernanceApproval::query()->forceCreate([
             'invocation_row_id' => $row->getKey(),
             'approval_id' => $id,
@@ -66,16 +90,22 @@ final class ApprovalStore
             'owner_id' => $owner['owner_id'],
             'approver_id' => $person,
             'approval_mode' => $owner['mode'] ?? null,
-            'preview' => $message,
             'expires_at' => self::expiresAt($row),
-        ]);
+        ] + $delivery);
+    }
 
+    /** @param array{is_group?: true} $channel */
+    private static function stageDelivery(GovernanceInvocation $row, string $recipient, string $message, array $channel = []): string
+    {
+        $id = (string) Str::ulid();
         GovernanceOutboxMessage::query()->forceCreate([
             'invocation_row_id' => $row->getKey(),
             'delivery_id' => $id,
-            'recipient_id' => $person,
+            'recipient_id' => $recipient,
             'payload' => $message,
-        ]);
+        ] + $channel);
+
+        return $id;
     }
 
     public static function hasCombinedLegacyCard(GovernanceInvocation $row): bool

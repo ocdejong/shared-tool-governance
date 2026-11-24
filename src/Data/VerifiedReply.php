@@ -11,5 +11,6 @@ final readonly class VerifiedReply
         public string $senderId,
         public string $cardId,
         public string $replyId,
+        public ?string $chatId = null,
     ) {}
 }

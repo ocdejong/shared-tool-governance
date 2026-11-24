@@ -12,8 +12,11 @@ use Ocdejong\SharedToolGovernance\Approvals\Approvals;
 use Ocdejong\SharedToolGovernance\Approvals\ApprovalUndeliverable;
 use Ocdejong\SharedToolGovernance\Authorization\Authorizer;
 use Ocdejong\SharedToolGovernance\Contracts\ApproverPolicy;
+use Ocdejong\SharedToolGovernance\Contracts\GroupApprovalChannel;
 use Ocdejong\SharedToolGovernance\Data\ApprovalMode;
 use Ocdejong\SharedToolGovernance\Data\ApprovalRule;
+use Ocdejong\SharedToolGovernance\Data\GroupApprovalPrompt;
+use Ocdejong\SharedToolGovernance\Data\Invocation;
 use Ocdejong\SharedToolGovernance\Data\OwnerReference;
 use Ocdejong\SharedToolGovernance\Data\ResourceReference;
 use Ocdejong\SharedToolGovernance\Data\Scope;
@@ -254,4 +257,51 @@ it('revokes when the host changes eligibility after a decision', function (): vo
     expect(app(Approvals::class)->receipt('visit'))->toBe(['status' => 'revoked'])
         ->and($host->executions)->toBe([])
         ->and(GovernanceGrant::query()->count())->toBe(0);
+});
+
+it('delivers one safe group preview and requires the original chat on every reply', function (): void {
+    $host = groupHost(new ApprovalRule(ApprovalMode::ANY, ['alice', 'bob']));
+    $channel = new class implements GroupApprovalChannel
+    {
+        /** @var list<array{string, string, string}> */
+        public array $cards = [];
+
+        public function promptFor(Invocation $call, array $targets, array $eligiblePeople): GroupApprovalPrompt
+        {
+            expect($eligiblePeople)->toBe(['alice', 'bob']);
+
+            return new GroupApprovalPrompt('family-chat', 'Move the appointment?');
+        }
+
+        public function allowsDisclosure(Scope $scope, GroupApprovalPrompt $prompt): bool
+        {
+            return true;
+        }
+
+        public function deliver(Scope $scope, string $deliveryId, GroupApprovalPrompt $prompt): string
+        {
+            $this->cards[] = [$deliveryId, $prompt->chatId, $prompt->preview];
+
+            return 'group-card';
+        }
+    };
+    app()->instance(GroupApprovalChannel::class, $channel);
+    app(Authorizer::class)->authorize($host->call());
+    ApprovalHost::deliverCards();
+    expect($channel->cards)->toHaveCount(1);
+    [[$deliveryId, $chatId, $preview]] = $channel->cards;
+    $scope = $host->context->scope;
+    expect($chatId)->toBe('family-chat')
+        ->and($preview)->toBe('Move the appointment?')
+        ->and($host->inbox->cards($scope, 'alice'))->toBe([])
+        ->and($host->inbox->cards($scope, 'bob'))->toBe([]);
+
+    $approvals = app(Approvals::class);
+    $approve = ApprovalDecision::APPROVE;
+    expect($approvals->respond($deliveryId, $approve, new VerifiedReply($scope, 'alice', 'group-card', 'a'))->status)
+        ->toBe('refused');
+    expect($approvals->respond($deliveryId, $approve, new VerifiedReply($scope, 'alice', 'group-card', 'a', $chatId))->accepted)
+        ->toBeTrue();
+    $late = $approvals->respond($deliveryId, ApprovalDecision::DECLINE, new VerifiedReply($scope, 'bob', 'group-card', 'b', $chatId));
+    expect($late->decision)->toBe($approve)->and($late->accepted)->toBeFalse();
 });

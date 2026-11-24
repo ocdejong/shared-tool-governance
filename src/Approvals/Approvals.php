@@ -37,18 +37,23 @@ final readonly class Approvals
             return ApprovalResponse::refused();
         }
 
-        return DB::transaction(function () use ($approvalId, $decision, $reply): ApprovalResponse {
-            $card = GovernanceOutboxMessage::query()
-                ->where('delivery_id', $approvalId)
-                ->where('card_id', $reply->cardId)
-                ->where('recipient_id', $reply->senderId)
-                ->where('delivered_at', '!=', null)
-                ->first();
-            if ($card === null) {
-                return ApprovalResponse::refused();
-            }
+        $query = GovernanceOutboxMessage::query()
+            ->where('delivery_id', $approvalId)
+            ->where('card_id', $reply->cardId)
+            ->where('delivered_at', '!=', null);
+        $query->getQuery()->useWritePdo();
+        $card = $query->first();
+        if ($card === null || $card->getAttribute('recipient_id') !== ($card->getAttribute('is_group') ? $reply->chatId : $reply->senderId)) {
+            return ApprovalResponse::refused();
+        }
 
-            $row = ApprovalStore::locked((int) $card->getAttribute('invocation_row_id'));
+        return DB::transaction(function () use ($approvalId, $card, $decision, $reply): ApprovalResponse {
+            $rowId = (int) $card->getAttribute('invocation_row_id');
+            if (DB::connection()->getDriverName() === 'sqlite') {
+                // SQLite ignores FOR UPDATE. Acquire its writer lock before taking a read snapshot.
+                DB::table('governance_invocations')->where('id', $rowId)->update(['id' => DB::raw('id')]);
+            }
+            $row = ApprovalStore::locked($rowId);
             if ($row === null || ! $this->access->allows(
                 ApprovalStore::scope($row), $reply->scope, $reply->senderId,
                 $row->getAttribute('requester_id'), ...$row->getAttribute('audience'),
@@ -56,8 +61,9 @@ final readonly class Approvals
                 return ApprovalResponse::refused();
             }
 
-            $original = ApprovalStore::approvals($row)->where('approval_id', $approvalId)
-                ->where('approver_id', $reply->senderId)->first();
+            $deliveryColumn = $card->getAttribute('is_group') ? 'group_delivery_id' : 'approval_id';
+            $original = ApprovalStore::approvals($row)
+                ->where($deliveryColumn, $approvalId)->where('approver_id', $reply->senderId)->first();
 
             return $original === null
                 ? ApprovalResponse::refused()
@@ -91,7 +97,10 @@ final readonly class Approvals
         }
 
         $card->forceFill(['decision' => $decision->value, 'reply_id' => $reply->replyId, 'decided_at' => now()])->save();
-        InvocationStore::audit($row, 'approval_decided', ['approval_id' => $card->getAttribute('approval_id'), 'decision' => $decision->value]);
+        InvocationStore::audit($row, 'approval_decided', [
+            'approval_id' => $card->getAttribute('group_delivery_id') ?? $card->getAttribute('approval_id'),
+            'decision' => $decision->value,
+        ]);
 
         $status = match (true) {
             $decision === ApprovalDecision::DECLINE => 'declined',
