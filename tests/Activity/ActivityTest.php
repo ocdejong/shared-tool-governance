@@ -143,46 +143,76 @@ it('prunes terminal inputs at thirty days and preserves accurately filtered rece
         throw new LogicException('Expected issued grants.');
     }
 
+    DB::enableQueryLog();
     expect($activity->revoke('revoked'))->toBeTrue()
         ->and(fn () => $grants->redeem($revoked, $host->call('revoked')))->toThrow(RedemptionRefused::class);
     $grants->redeem($unknownGrant, $unknownCall);
-    $grants->recordOutcome('unknown', ExecutionStatus::UNKNOWN, 'private provider reference');
     expect($activity->revoke('unknown'))->toBeFalse();
-
-    $authorize->authorize($host->call('waiting', two: true));
-    expect(DB::table('governance_approvals')->value('preview'))->toBeString()->not->toContain('Move the repair visit', '10:00')
-        ->and(DB::table('governance_outbox_messages')->value('payload'))->toBeString()->not->toContain('Move the repair visit', '10:00')
-        ->and(DB::table('governance_invocations')->where('invocation_id', 'waiting')->value('frozen_inputs'))
-        ->toBeString()->not->toContain('hidden detail', '10:00');
+    DB::disableQueryLog();
+    $grants->recordOutcome('unknown', ExecutionStatus::UNKNOWN, 'private provider reference');
 
     activityViewer($host, 'alice');
-    $rules->setRules($requester->scope, new ResourceReference('item', 'personal'), 1, ['enabled' => false]);
+    $rules->setRules($requester->scope, new ResourceReference('item', 'personal'), 1, ['rules' => ['items' => Verdict::DELEGATE]]);
+    $host->context = $requester;
+    $authorize->authorize($host->call('waiting', two: true));
+    $previews = DB::table('governance_approvals')->pluck('preview');
+    $payloads = DB::table('governance_outbox_messages')->pluck('payload');
+    expect($previews)->toHaveCount(2)->and($payloads)->toHaveCount(2);
+    foreach ($previews->concat($payloads) as $cardContent) {
+        expect($cardContent)->toBeString()
+            ->not->toContain('Move the repair visit')
+            ->not->toContain('10:00');
+    }
+
+    expect(DB::table('governance_invocations')->where('invocation_id', 'waiting')->value('frozen_inputs'))
+        ->toBeString()
+        ->not->toContain('hidden detail')
+        ->not->toContain('10:00');
+
+    activityViewer($host, 'alice');
+    $rules->setRules($requester->scope, new ResourceReference('item', 'personal'), 2, ['enabled' => false]);
     $host->context = $requester;
     $authorize->authorize($host->call('denied'));
     expect($activity->recentUse('unused'))->toBe([['status' => 'granted']]);
 
     DB::enableQueryLog();
+    $receipts = [];
+    foreach (['alice', 'bob', 'requester'] as $viewer) {
+        activityViewer($host, $viewer);
+        $receipts[] = $activity->recentUse();
+    }
+    $host->context = $requester;
+
+    $pruneOutput = [];
+    $prune = static function () use (&$pruneOutput): int {
+        $exitCode = Artisan::call('shared-tool-governance:prune');
+        $pruneOutput[] = Artisan::output();
+
+        return $exitCode;
+    };
+
     $this->travel(29)->days();
-    expect(Artisan::call('shared-tool-governance:prune'))->toBe(0, Artisan::output())
+    expect($prune())->toBe(0, Artisan::output())
         ->and(DB::table('governance_invocations')->whereNotNull('frozen_inputs')->count())->toBe(5);
     $this->travel(2)->days();
 
-    expect(Artisan::call('shared-tool-governance:prune'))->toBe(0, Artisan::output())
+    expect($prune())->toBe(0, Artisan::output())
         ->and(DB::table('governance_invocations')->whereNotNull('frozen_inputs')->pluck('invocation_id')->all())->toBe(['unknown'])
-        ->and(DB::table('governance_approvals')->value('preview'))->toBeNull()
-        ->and(DB::table('governance_outbox_messages')->value('payload'))->toBeNull()
+        ->and(DB::table('governance_approvals')->whereNotNull('preview')->exists())->toBeFalse()
+        ->and(DB::table('governance_outbox_messages')->whereNotNull('payload')->exists())->toBeFalse()
         ->and($activity->recentUse('unknown'))->toBe([['status' => 'granted', 'outcome' => 'unknown']]);
 
     DB::disableQueryLog();
     $grants->recordOutcome('unknown', ExecutionStatus::SUCCEEDED, 'private provider reference');
     DB::enableQueryLog();
-    expect(Artisan::call('shared-tool-governance:prune'))->toBe(0, Artisan::output())
+    expect($prune())->toBe(0, Artisan::output())
         ->and(DB::table('governance_invocations')->whereNotNull('frozen_inputs')->count())->toBe(1);
     $this->travel(30)->days();
-    expect(Artisan::call('shared-tool-governance:prune'))->toBe(0, Artisan::output())
-        ->and(Artisan::call('shared-tool-governance:prune'))->toBe(0, Artisan::output())
+    expect($prune())->toBe(0, Artisan::output())
+        ->and($prune())->toBe(0, Artisan::output())
         ->and(DB::table('governance_invocations')->whereNotNull('frozen_inputs')->count())->toBe(0);
 
+    $receipts[] = $activity->recentUse();
     expect($activity->recentUse('unused'))->toBe([['status' => 'approved_unused']])
         ->and($activity->recentUse('revoked'))->toBe([['status' => 'revoked']])
         ->and($activity->recentUse('denied'))->toBe([['status' => 'denied']])
@@ -190,14 +220,35 @@ it('prunes terminal inputs at thirty days and preserves accurately filtered rece
         ->and($activity->recentUse('waiting'))->toBe([['status' => 'expired']]);
 
     activityViewer($host, 'alice');
+    $receipts[] = $activity->recentUse();
     expect(array_column($activity->recentUse('denied')[0]['targets'] ?? [], 'id'))->toBe(['personal']);
     activityViewer($host, 'bob');
-    expect(array_column($activity->recentUse(), 'invocation_id'))->toBe(['waiting'])
-        ->and(array_column($activity->recentUse()[0]['targets'] ?? [], 'id'))->toBe(['shared']);
+    $bob = $activity->recentUse();
+    $receipts[] = $bob;
+    expect(array_column($bob, 'invocation_id'))->toBe(['waiting'])
+        ->and(array_column($bob[0]['targets'] ?? [], 'id'))->toBe(['shared']);
     expect(DB::table('governance_invocations')->where('invocation_id', 'waiting')->value('receipt_targets'))
-        ->toBeString()->not->toContain('personal', 'shared');
-    $audit = json_encode(DB::table('governance_audit_events')->get(), JSON_THROW_ON_ERROR);
-    $receipts = json_encode($activity->recentUse(), JSON_THROW_ON_ERROR);
-    $queries = json_encode(DB::getQueryLog(), JSON_THROW_ON_ERROR);
-    expect($audit.$receipts.$queries.Artisan::output())->not->toContain($unused, $revoked, $unknownGrant, 'hidden detail', 'scheduled_time', 'Move the repair visit', 'private provider reference');
+        ->toBeString()
+        ->not->toContain('personal')
+        ->not->toContain('shared');
+
+    $outputs = [
+        'audit' => json_encode(DB::table('governance_audit_events')->get(), JSON_THROW_ON_ERROR),
+        'receipts' => json_encode($receipts, JSON_THROW_ON_ERROR),
+        'query log' => json_encode(DB::getQueryLog(), JSON_THROW_ON_ERROR),
+        'prune output' => implode("\n", $pruneOutput),
+    ];
+    foreach ($outputs as $surface => $output) {
+        foreach ([
+            'unused grant token' => $unused,
+            'revoked grant token' => $revoked,
+            'redeemed grant token' => $unknownGrant,
+            'raw argument value' => 'hidden detail',
+            'raw argument name' => 'scheduled_time',
+            'private preview' => 'Move the repair visit',
+            'provider reference' => 'private provider reference',
+        ] as $field => $value) {
+            expect(str_contains($output, $value))->toBeFalse("Found {$field} in {$surface}.");
+        }
+    }
 });
