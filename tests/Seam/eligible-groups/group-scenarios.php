@@ -169,7 +169,9 @@ function groupReplyRaces(GroupChat $chat): void
         });
         [$winner, $accepted] = explode(':', $local);
         check($remote === $winner.':'.(int) ($id === 'duplicate' || $accepted === '0'), 'Concurrent replies did not agree on the first decision');
-        check(file_put_contents(storage_path($id.'-winner'), $winner) !== false, 'Could not persist the winning decision');
+        if ($id === 'opposite') {
+            check(file_put_contents(storage_path('opposite-winner'), $winner) !== false, 'Could not persist the winning decision');
+        }
     }
 }
 

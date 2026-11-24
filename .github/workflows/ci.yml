@@ -17,11 +17,12 @@ jobs:
       - uses: shivammathur/setup-php@v2
         with:
           php-version: '8.5'
-          extensions: pdo_sqlite, zip
+          extensions: pdo_sqlite, pcntl, zip
           tools: composer:v2
           coverage: none
       - run: composer install --no-interaction --no-progress
       - run: composer test
+      - run: tests/Seam/eligible-groups/consumer.sh HEAD
       - run: bin/consumer-smoke --demo HEAD
       - run: bin/dist-install HEAD
       - if: github.event_name == 'push' && github.repository == 'ocdejong/shared-tool-governance'
@@ -30,6 +31,12 @@ jobs:
   postgresql:
     name: PostgreSQL gate
     runs-on: ubuntu-latest
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: 5432
+      DB_DATABASE: shared_tool_governance
+      DB_USERNAME: sail
+      DB_PASSWORD: ci-fixture
     services:
       postgres:
         image: postgres:17
@@ -47,6 +54,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: shivammathur/setup-php@v2
         with:
@@ -56,9 +64,4 @@ jobs:
           coverage: none
       - run: composer install --no-interaction --no-progress
       - run: flock /tmp/shared-tool-governance-pgsql.lock composer test
-        env:
-          DB_HOST: 127.0.0.1
-          DB_PORT: 5432
-          DB_DATABASE: shared_tool_governance
-          DB_USERNAME: sail
-          DB_PASSWORD: ci-fixture
+      - run: tests/Seam/eligible-groups/consumer.sh HEAD
