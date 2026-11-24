@@ -1,0 +1,62 @@
+name: CI
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  sqlite:
+    name: SQLite gate and Laravel installs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: pdo_sqlite, zip
+          tools: composer:v2
+          coverage: none
+      - run: composer install --no-interaction --no-progress
+      - run: composer test
+      - run: bin/consumer-smoke HEAD
+      - run: bin/dist-install HEAD
+
+  postgresql:
+    name: PostgreSQL gate
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: shared_tool_governance
+          POSTGRES_USER: sail
+          POSTGRES_PASSWORD: ci-fixture
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sail -d shared_tool_governance"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: pdo_pgsql, pcntl
+          tools: composer:v2
+          coverage: none
+      - run: composer install --no-interaction --no-progress
+      - run: flock /tmp/shared-tool-governance-pgsql.lock composer test
+        env:
+          DB_HOST: 127.0.0.1
+          DB_PORT: 5432
+          DB_DATABASE: shared_tool_governance
+          DB_USERNAME: sail
+          DB_PASSWORD: ci-fixture

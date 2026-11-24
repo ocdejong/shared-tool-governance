@@ -1,0 +1,355 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (( $# != 1 )); then
+    echo 'Usage: bin/dist-install <rev>' >&2
+    exit 2
+fi
+
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+revision=$(git -C "$repo" rev-parse --verify --end-of-options "${1}^{commit}")
+package=ocdejong/shared-tool-governance
+version="0.0.0-alpha+$revision"
+scratch=$(mktemp -d)
+trap 'rm -rf -- "$scratch"' EXIT
+
+mkdir "$scratch/export" "$scratch/artifacts"
+archive_name="shared-tool-governance-$revision"
+archive="$scratch/artifacts/$archive_name.zip"
+database="$scratch/consumer/database/database.sqlite"
+app_key=$(php -r 'echo "base64:".base64_encode(random_bytes(32));')
+
+in_consumer() {
+    env -i PATH="$PATH" HOME="$scratch" COMPOSER_HOME="$scratch/composer" \
+        COMPOSER_CACHE_DIR="${COMPOSER_CACHE_DIR:-$HOME/.cache/composer}" \
+        APP_ENV=testing APP_KEY="$app_key" DB_CONNECTION=sqlite DB_DATABASE="$database" \
+        QUEUE_CONNECTION=database "$@"
+}
+
+compose() {
+    in_consumer composer --no-interaction --no-ansi --no-plugins "$@"
+}
+
+artisan() {
+    in_consumer php artisan "$@"
+}
+
+git -C "$repo" ls-tree -r --name-only "$revision" -- database/migrations > "$scratch/migrations"
+git -C "$repo" archive "$revision" | tar -x -C "$scratch/export"
+(
+    cd "$scratch/export"
+    in_consumer php -r '
+        $manifest = json_decode(file_get_contents("composer.json"), true, flags: JSON_THROW_ON_ERROR);
+        $manifest["version"] = $argv[1];
+        if (file_put_contents("composer.json", json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)."\n") === false) {
+            exit(1);
+        }
+    ' "$version"
+    compose archive --format=zip --dir="$scratch/artifacts" --file="$archive_name"
+)
+rm -rf -- "$scratch/export"
+
+cd "$scratch"
+compose create-project --no-dev --no-scripts --prefer-dist --no-progress \
+    laravel/laravel consumer '^13.0'
+cd "$scratch/consumer"
+touch "$database"
+compose config repositories.governance artifact ../artifacts
+compose require --update-no-dev --prefer-dist --no-progress "$package:$version"
+
+cat > app/Providers/AppointmentServiceProvider.php <<'PHP'
+<?php
+
+declare(strict_types=1);
+
+namespace App\Providers;
+
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\ServiceProvider;
+use InvalidArgumentException;
+use Ocdejong\SharedToolGovernance\Approvals\ApprovalPreview;
+use Ocdejong\SharedToolGovernance\Contracts\ApprovalNotifier;
+use Ocdejong\SharedToolGovernance\Contracts\CompletionHandler;
+use Ocdejong\SharedToolGovernance\Contracts\ResourceAuthority;
+use Ocdejong\SharedToolGovernance\Contracts\ResumptionContext;
+use Ocdejong\SharedToolGovernance\Contracts\ToolExecutor;
+use Ocdejong\SharedToolGovernance\Contracts\TrustedInvocationContext;
+use Ocdejong\SharedToolGovernance\Data\ExecutionResult;
+use Ocdejong\SharedToolGovernance\Data\ExecutionStatus;
+use Ocdejong\SharedToolGovernance\Data\Invocation;
+use Ocdejong\SharedToolGovernance\Data\InvocationContext;
+use Ocdejong\SharedToolGovernance\Data\OwnerReference;
+use Ocdejong\SharedToolGovernance\Data\OwnerType;
+use Ocdejong\SharedToolGovernance\Data\ResourceReference;
+use Ocdejong\SharedToolGovernance\Data\Scope;
+use Ocdejong\SharedToolGovernance\Data\ToolDefinition;
+use Ocdejong\SharedToolGovernance\LocalInbox\LocalInbox;
+use Ocdejong\SharedToolGovernance\Tools\ToolRegistry;
+
+final class AppointmentServiceProvider extends ServiceProvider implements CompletionHandler, ResourceAuthority, ResumptionContext, ToolExecutor, TrustedInvocationContext
+{
+    public const ACTION = 'appointment.reschedule';
+
+    public const DELEGATED_CALL = 'delegated-reschedule';
+
+    public const TIME = '2026-11-24T15:00:00Z';
+
+    public string $viewer = 'appointment-owner';
+
+    public function register(): void
+    {
+        foreach ([self::class, CompletionHandler::class, ResourceAuthority::class, ResumptionContext::class, TrustedInvocationContext::class] as $contract) {
+            $this->app->instance($contract, $this);
+        }
+        $this->app->singleton(LocalInbox::class);
+        $this->app->alias(LocalInbox::class, ApprovalNotifier::class);
+    }
+
+    public function boot(ToolRegistry $tools): void
+    {
+        Http::preventStrayRequests();
+        $tools->register(new ToolDefinition(
+            name: 'reschedule',
+            version: '1',
+            actionKey: self::ACTION,
+            inputSchema: [
+                'type' => 'object',
+                'properties' => ['time' => ['type' => 'string', 'format' => 'date-time']],
+                'required' => ['time'],
+                'additionalProperties' => false,
+            ],
+            normalizeArguments: static function (array $arguments): array {
+                if ($arguments !== ['time' => self::TIME]) {
+                    throw new InvalidArgumentException('Expected the fixture appointment time.');
+                }
+
+                return $arguments;
+            },
+            resolveTargets: static fn () => [self::appointment()],
+            executorId: self::class,
+            effect: 'Reschedule the fixture appointment',
+            resultSchema: ['type' => 'object', 'properties' => ['time' => ['type' => 'string']]],
+            approvalPreview: static fn (Invocation $call) => new ApprovalPreview(
+                $call->reason,
+                'Move the fixture appointment to '.$call->arguments['time'],
+            ),
+        ));
+    }
+
+    public static function appointment(): ResourceReference
+    {
+        return new ResourceReference('appointment', 'fixture-appointment');
+    }
+
+    public function current(): InvocationContext
+    {
+        return new InvocationContext(new Scope('dist-install', 'fixture-team'), $this->viewer, 'fixture-runtime', [$this->viewer]);
+    }
+
+    public function forInvocation(Scope $scope, string $invocationId): ?InvocationContext
+    {
+        $requester = Cache::get('fixture.pending-requester');
+
+        return $invocationId === self::DELEGATED_CALL && is_string($requester) && $this->isMember($scope, $requester)
+            ? new InvocationContext($scope, $requester, 'fixture-runtime', [$requester]) : null;
+    }
+
+    public function isMember(Scope $scope, string $personId): bool
+    {
+        return $scope->equals($this->current()->scope) && in_array($personId, ['appointment-owner', 'scheduler'], true);
+    }
+
+    public function ownerOf(Scope $scope, ResourceReference $resource): ?OwnerReference
+    {
+        return $scope->equals($this->current()->scope) && $resource == self::appointment()
+            ? new OwnerReference(OwnerType::PERSON, 'appointment-owner') : null;
+    }
+
+    public function canManageRules(Scope $scope, string $personId, ResourceReference $resource, OwnerReference $owner): bool
+    {
+        return $personId === $this->approverFor($scope, $resource, $owner);
+    }
+
+    public function approverFor(Scope $scope, ResourceReference $resource, OwnerReference $owner): ?string
+    {
+        return $this->ownerOf($scope, $resource) == $owner ? $owner->id : null;
+    }
+
+    public function execute(Invocation $frozenCall, array $approvedTargets): ExecutionResult
+    {
+        if ($approvedTargets != [self::appointment()] || $frozenCall->arguments !== ['time' => self::TIME]) {
+            return new ExecutionResult(ExecutionStatus::FAILED);
+        }
+
+        Cache::increment('fixture.executions');
+        Cache::put('fixture.appointment-time', $frozenCall->arguments['time']);
+
+        return new ExecutionResult(ExecutionStatus::SUCCEEDED, $frozenCall->arguments);
+    }
+
+    public function completed(Scope $scope, string $invocationId, ExecutionResult $result): void
+    {
+        $context = $this->forInvocation($scope, $invocationId);
+        if ($context !== null) {
+            Cache::put('fixture.completion.'.$context->requesterId, $result->result);
+        }
+    }
+}
+PHP
+
+in_consumer php -r '
+    $path = "bootstrap/providers.php";
+    $providers = require $path;
+    $providers[] = App\Providers\AppointmentServiceProvider::class;
+    if (file_put_contents($path, "<?php\n\nreturn ".var_export($providers, true).";\n") === false) {
+        exit(1);
+    }
+'
+artisan migrate --force
+artisan config:cache
+
+cat > dist-smoke.php <<'PHP'
+<?php
+
+declare(strict_types=1);
+
+use App\Providers\AppointmentServiceProvider as Fixture;
+use Composer\InstalledVersions;
+use Illuminate\Contracts\Console\Kernel;
+use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
+use Ocdejong\SharedToolGovernance\Approvals\ApprovalDecision;
+use Ocdejong\SharedToolGovernance\Approvals\Approvals;
+use Ocdejong\SharedToolGovernance\Data\Verdict;
+use Ocdejong\SharedToolGovernance\Data\VerifiedReply;
+use Ocdejong\SharedToolGovernance\Discovery\DiscoveryMode;
+use Ocdejong\SharedToolGovernance\Discovery\DiscoveryTarget;
+use Ocdejong\SharedToolGovernance\Discovery\ToolDiscovery;
+use Ocdejong\SharedToolGovernance\Governance;
+use Ocdejong\SharedToolGovernance\GovernanceServiceProvider;
+use Ocdejong\SharedToolGovernance\LocalInbox\LocalInbox;
+use Ocdejong\SharedToolGovernance\Rules\ResourceRules;
+
+require __DIR__.'/vendor/autoload.php';
+
+function check(bool $condition, string $message): void
+{
+    if (! $condition) {
+        throw new RuntimeException($message);
+    }
+}
+
+function runSmoke(array $argv): void
+{
+    $app = require __DIR__.'/bootstrap/app.php';
+    $app->make(Kernel::class)->bootstrap();
+
+    check($app->getProvider(GovernanceServiceProvider::class) !== null, 'Package discovery failed.');
+    check($app->configurationIsCached() && config('shared-tool-governance') !== null, 'Expected cached package config.');
+    check(config('queue.default') === 'database' && config('cache.default') === 'database', 'Expected persistent host queue and cache.');
+
+    $approvals = app(Approvals::class);
+    $jobs = DB::table('jobs');
+    $result = ['time' => Fixture::TIME];
+
+    if ($argv[1] === 'verify') {
+        app(Fixture::class)->viewer = 'scheduler';
+        check(Cache::get('fixture.executions') === 2 && Cache::get('fixture.appointment-time') === Fixture::TIME,
+            'Expected one direct and one delegated reschedule.');
+        check($jobs->count() === 0 && DB::table('failed_jobs')->count() === 0, 'A worker left queued or failed jobs.');
+        check($approvals->receipt(Fixture::DELEGATED_CALL) === ['status' => 'granted', 'outcome' => 'success'],
+            'Expected a successful delegated receipt.');
+        check(Cache::get('fixture.completion.scheduler') === $result && ! Cache::has('fixture.completion.appointment-owner'),
+            'Expected completion in the requester inbox only.');
+        echo "Fresh workers resumed the approved call once and delivered its result locally.\n";
+
+        return;
+    }
+
+    [, , $package, $version, $archive, $manifest] = $argv;
+    $installed = InstalledVersions::getInstallPath($package);
+    check($installed !== null && realpath($installed) === __DIR__.'/vendor/'.$package && ! is_link($installed),
+        'Expected an extracted vendor package.');
+    check(InstalledVersions::getPrettyVersion($package) === $version, 'Composer selected a different version.');
+    $lock = json_decode(file_get_contents(__DIR__.'/composer.lock'), true, flags: JSON_THROW_ON_ERROR);
+    $entries = array_column($lock['packages'], null, 'name');
+    $dist = $entries[$package]['dist'] ?? [];
+    check(($dist['type'] ?? null) === 'zip' && realpath($dist['url'] ?? '') === realpath($archive)
+        && ! isset($entries[$package]['source']), 'Composer did not resolve the local archive.');
+
+    foreach (['src', 'config', 'database'] as $directory) {
+        check(is_dir($installed.'/'.$directory), "Missing package directory $directory.");
+    }
+    foreach (['tests', '.git'] as $excluded) {
+        check(! file_exists($installed.'/'.$excluded), "Unexpected package entry $excluded.");
+    }
+
+    $migrations = file($manifest, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    check($migrations !== false && $migrations !== [], 'The source revision has no package migrations.');
+    $ran = DB::table('migrations')->pluck('migration')->all();
+    foreach ($migrations as $migration) {
+        check(is_file($installed.'/'.$migration) && in_array(basename($migration, '.php'), $ran, true),
+            "Package migration missing or not run: $migration");
+    }
+
+    $host = app(Fixture::class);
+    $scope = $host->current()->scope;
+    $resource = Fixture::appointment();
+    $owner = $host->ownerOf($scope, $resource);
+    check($owner !== null, 'The fixture appointment has no owner.');
+
+    Cache::put('fixture.executions', 0);
+    $governance = app(Governance::class);
+    $call = static fn (string $id) => $governance->call($id, 'reschedule', '1', $result, 'Move the fixture appointment.');
+    check($call('default-deny') === ['status' => 'denied', 'call_id' => 'default-deny', 'result' => null]
+        && Cache::get('fixture.executions') === 0, 'An unconfigured tool must default to deny.');
+
+    $rules = app(ResourceRules::class);
+    $allowed = $rules->setRules($scope, $resource, 0, ['rules' => [Fixture::ACTION => Verdict::ALLOW]]);
+    $discovered = app(ToolDiscovery::class)->discover($scope, [new DiscoveryTarget($owner, $resource)], DiscoveryMode::MATCH);
+    check(array_keys($discovered->actions) === [Fixture::ACTION]
+        && array_column($discovered->actions[Fixture::ACTION], 'verdict') === [Verdict::ALLOW],
+        'Discovery did not find the one registered and allowed tool.');
+    check($call('direct-reschedule') === ['status' => 'success', 'call_id' => 'direct-reschedule', 'result' => $result]
+        && Cache::get('fixture.executions') === 1, 'Explicit allow did not execute the tool once.');
+
+    $rules->setRules($scope, $resource, $allowed->revision, ['rules' => [Fixture::ACTION => Verdict::DELEGATE]]);
+    $host->viewer = 'scheduler';
+    Cache::put('fixture.pending-requester', $host->viewer);
+    $id = Fixture::DELEGATED_CALL;
+    check($call($id) === ['status' => 'pending_approval', 'call_id' => $id, 'result' => null]
+        && $jobs->count() === 1, 'Expected one queued private approval and a pending response.');
+    check(Artisan::call('queue:work', ['--once' => true, '--queue' => 'default', '--tries' => 1]) === 0, 'Approval delivery worker failed.');
+
+    $inbox = app(LocalInbox::class);
+    $cards = $inbox->cards($scope, $owner->id);
+    check(count($cards) === 1 && $inbox->cards($scope, 'scheduler') === [], 'Expected one card in the owner inbox only.');
+    $card = $cards[0];
+    check(str_contains($card->message, Fixture::TIME), 'The approval card omitted the requested time.');
+    $reply = new VerifiedReply($scope, $owner->id, $card->cardId, 'fixture-owner-reply');
+    check($approvals->decide($card->approvalId, ApprovalDecision::APPROVE, $reply)
+        && $approvals->receipt($id) === ['status' => 'approved']
+        && $jobs->count() === 1 && Cache::get('fixture.executions') === 1,
+        'Expected the approved call to wait for a fresh worker without executing.');
+    echo "Verified default denial, discovery, explicit allow and private approval.\n";
+}
+
+try {
+    runSmoke($argv);
+} catch (Throwable $error) {
+    fwrite(STDERR, $error->getMessage().PHP_EOL);
+    exit(1);
+}
+PHP
+
+in_consumer php dist-smoke.php prepare "$package" "$version" "$archive" "$scratch/migrations"
+artisan queue:work --once --queue=default --tries=1
+artisan queue:work --once --queue=default --tries=1
+in_consumer php dist-smoke.php verify
+
+output=$(mktemp -d)
+cp "$archive" "$output/"
+echo "Distribution install passed for $revision ($version). SHA-256 and artifact path:"
+sha256sum "$output/$archive_name.zip"
