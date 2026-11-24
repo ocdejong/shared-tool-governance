@@ -22,8 +22,8 @@ final readonly class Governance
     ) {}
 
     /**
-     * Call outside an open database transaction. A repeated ID returns the stored
-     * authorization status with a null result.
+     * Call outside an open database transaction. A repeat reports the recorded
+     * execution outcome or current authorization status, with a null result.
      *
      * @param  array<string, mixed>  $arguments
      * @return array{status: string, call_id: string, result: array<string, mixed>|null}
@@ -39,7 +39,9 @@ final readonly class Governance
         $authorization = $this->authorizer->authorize($invocation);
         $token = $authorization->grantToken();
         if ($token === null) {
-            return ['status' => $authorization->status, 'call_id' => $id, 'result' => null];
+            $status = $authorization->executionOutcome()->value ?? $authorization->status;
+
+            return ['status' => $status, 'call_id' => $id, 'result' => null];
         }
 
         $execution = $this->grants->redeem($token, $invocation);

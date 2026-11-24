@@ -91,6 +91,8 @@ final readonly class Authorizer
             throw new InvocationConflict('Invocation ID is already bound to a different call.');
         }
 
-        return new AuthorizationResult(ActivityState::read($row, now())->status, $id);
+        $state = ActivityState::read($row, now());
+
+        return new AuthorizationResult($state->status, $id, executionOutcome: $state->outcome);
     }
 }

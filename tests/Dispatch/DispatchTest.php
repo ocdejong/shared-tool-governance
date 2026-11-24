@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
+use Ocdejong\SharedToolGovernance\Authorization\Authorizer;
 use Ocdejong\SharedToolGovernance\Authorization\InvocationConflict;
 use Ocdejong\SharedToolGovernance\Contracts\ApprovalNotifier;
 use Ocdejong\SharedToolGovernance\Contracts\ResourceAuthority;
@@ -104,13 +105,59 @@ it('discovers and dispatches one registration with the default Laravel bindings'
     expect($governance->call('appointment-allowed', $tool->name, $tool->version, $arguments, $reason))
         ->toBe(['status' => 'success', 'call_id' => 'appointment-allowed', 'result' => ['time' => '14:30']])
         ->and($governance->call('appointment-allowed', $tool->name, $tool->version, ['time' => '14:30'], $reason))
-        ->toBe(['status' => 'granted', 'call_id' => 'appointment-allowed', 'result' => null])
+        ->toBe(['status' => 'success', 'call_id' => 'appointment-allowed', 'result' => null])
         ->and(fn () => $governance->call('appointment-allowed', $tool->name, $tool->version, ['time' => '15:00'], $reason))
         ->toThrow(InvocationConflict::class)
         ->and(DB::table('governance_invocations')->count())->toBe(2)
         ->and(DB::table('governance_grants')->whereNotNull('redeemed_at')->count())->toBe(1)
         ->and(DB::table('governance_outbox_messages')->count())->toBe(0);
+
+    $retry = app(Authorizer::class)->authorize(new Invocation(
+        'appointment-allowed', $tool->name, $tool->version, $arguments, $reason, $host->current(), $tool->executorId,
+    ));
+    expect($retry->grantToken())->toBeNull()
+        ->and($retry->jsonSerialize())->toBe(['status' => 'granted']);
+
+    $unused = app(Authorizer::class)->authorize(new Invocation(
+        'appointment-unused', $tool->name, $tool->version, $arguments, $reason, $host->current(), $tool->executorId,
+    ));
+    expect($unused->grantToken())->toBeString()
+        ->and($governance->call('appointment-unused', $tool->name, $tool->version, $arguments, $reason))
+        ->toBe(['status' => 'granted', 'call_id' => 'appointment-unused', 'result' => null]);
+
+    $host->audience = ['tom', 'pauline'];
+    expect(fn () => $governance->call('appointment-allowed', $tool->name, $tool->version, $arguments, $reason))
+        ->toThrow(InvocationConflict::class);
+
+    $host->audience = ['tom'];
+    $host->requester = 'pauline';
+    expect(fn () => $governance->call('appointment-allowed', $tool->name, $tool->version, $arguments, $reason))
+        ->toThrow(InvocationConflict::class);
 });
+
+it('reports the recorded outcome on a repeat after a failed or uncertain execution', function (ExecutionStatus $outcome): void {
+    $host = new RulesHost;
+    app()->instance(TrustedInvocationContext::class, $host);
+    app()->instance(ResourceAuthority::class, $host);
+    $calendar = new ResourceReference('calendar', 'tom');
+    $tool = appointmentTool($calendar);
+    app(ToolRegistry::class)->register($tool);
+    app(ResourceRules::class)->setRules($host->current()->scope, $calendar, 0, ['rules' => [$tool->actionKey => Verdict::ALLOW]]);
+    $this->mock(ToolExecutor::class)->shouldReceive('execute')->once()
+        ->andReturnUsing(static function () use ($outcome): ExecutionResult {
+            if ($outcome === ExecutionStatus::UNKNOWN) {
+                throw new RuntimeException('Provider response lost.');
+            }
+
+            return new ExecutionResult($outcome, providerReference: 'private-provider-id');
+        });
+
+    $governance = app(Governance::class);
+    $call = fn () => $governance->call('appointment-retry', $tool->name, $tool->version, ['time' => '14:30'], 'Move the visit');
+    expect($call())->toBe(['status' => $outcome->value, 'call_id' => 'appointment-retry', 'result' => []])
+        ->and($call())->toBe(['status' => $outcome->value, 'call_id' => 'appointment-retry', 'result' => null])
+        ->and(DB::table('governance_grants')->whereNotNull('redeemed_at')->count())->toBe(1);
+})->with([ExecutionStatus::FAILED, ExecutionStatus::UNKNOWN]);
 
 it('keeps discovery private by default and allows the host to supply the registry', function (): void {
     $host = new RulesHost;
