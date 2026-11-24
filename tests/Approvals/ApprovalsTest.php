@@ -8,13 +8,16 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Queue;
 use Ocdejong\SharedToolGovernance\Approvals\ApprovalDecision;
+use Ocdejong\SharedToolGovernance\Approvals\ApprovalPreview;
 use Ocdejong\SharedToolGovernance\Approvals\ApprovalResumption;
 use Ocdejong\SharedToolGovernance\Approvals\Approvals;
+use Ocdejong\SharedToolGovernance\Approvals\ApprovalSetupError;
 use Ocdejong\SharedToolGovernance\Approvals\ApprovalUndeliverable;
 use Ocdejong\SharedToolGovernance\Authorization\Authorizer;
 use Ocdejong\SharedToolGovernance\Contracts\ApprovalNotifier;
 use Ocdejong\SharedToolGovernance\Contracts\RuleEvaluator;
 use Ocdejong\SharedToolGovernance\Contracts\ToolExecutor;
+use Ocdejong\SharedToolGovernance\Data\Invocation;
 use Ocdejong\SharedToolGovernance\Data\InvocationContext;
 use Ocdejong\SharedToolGovernance\Data\ResourceReference;
 use Ocdejong\SharedToolGovernance\Data\Scope;
@@ -349,13 +352,52 @@ it('reports an unreachable owner after commit while the request keeps its expiry
     'conflicting approvers for one owner' => ['bob', ['personal' => 'alice'], true],
 ]);
 
-it('stages the request and its cards together and enqueues delivery after commit', function (): void {
+it('rolls back delegated calls whose tool cannot provide every approval preview', function (?Closure $preview): void {
+    Event::fake([ApprovalUndeliverable::class]);
+    $host = new ApprovalHost;
+    $validPreview = $host->approvalPreview;
+    $host->approvalPreview = $preview;
+    $host->bind();
+    $call = $host->call(two: true);
+
+    expect(fn () => app(Authorizer::class)->authorize($call))->toThrow(
+        fn (ApprovalSetupError $error) => expect($error->invocationId)->toBe($call->id),
+    );
+
+    expect(app(Approvals::class)->receipt($call->id))->toBeNull()
+        ->and(GovernanceInvocation::query()->count())->toBe(0)
+        ->and(GovernanceAuditEvent::query()->count())->toBe(0)
+        ->and(GovernanceApproval::query()->count())->toBe(0)
+        ->and(GovernanceOutboxMessage::query()->count())->toBe(0)
+        ->and(GovernanceGrant::query()->count())->toBe(0)
+        ->and($host->executions)->toBe([]);
+    Queue::assertNothingPushed();
+    Event::assertNotDispatched(ApprovalUndeliverable::class);
+
+    $host->approvalPreview = $validPreview;
+    $host->bind();
+    expect(app(Authorizer::class)->authorize($call)->status)->toBe('pending_approval');
+    Queue::assertPushed(DeliverApproval::class, 2);
+})->with([
+    'missing callback' => [null],
+    'null preview for the second approver' => [static fn (Invocation $call, array $targets, string $approver): ?ApprovalPreview => $approver === 'alice'
+        ? new ApprovalPreview('Valid reason', 'Valid change')
+        : null],
+    'blank preview reason' => [static fn () => new ApprovalPreview("\u{00A0}\t", 'Valid change')],
+    'blank preview scope and change' => [static fn () => new ApprovalPreview('Valid reason', " \n")],
+]);
+
+it('stages the request and all its cards together and enqueues delivery after commit', function (): void {
     $host = new ApprovalHost;
     $host->bind();
 
     DB::beginTransaction();
     try {
-        app(Authorizer::class)->authorize($host->call());
+        app(Authorizer::class)->authorize($host->call(two: true));
+        expect(GovernanceInvocation::query()->count())->toBe(1)
+            ->and(GovernanceApproval::query()->count())->toBe(2)
+            ->and(GovernanceOutboxMessage::query()->count())->toBe(2)
+            ->and(GovernanceGrant::query()->count())->toBe(0);
         Queue::assertNothingPushed();
     } finally {
         DB::rollBack();
@@ -363,16 +405,21 @@ it('stages the request and its cards together and enqueues delivery after commit
 
     app(ApprovalWork::class)->recover();
     Queue::assertNothingPushed();
-    expect(app(Approvals::class)->receipt('visit'))->toBeNull();
+    expect(app(Approvals::class)->receipt('visit'))->toBeNull()
+        ->and(GovernanceApproval::query()->count())->toBe(0)
+        ->and(GovernanceOutboxMessage::query()->count())->toBe(0);
 
-    requestApproval($host);
-    expect($host->inbox->cards($host->context->scope, 'alice'))->toHaveCount(1);
+    requestApproval($host, two: true);
+    expect($host->inbox->cards($host->context->scope, 'alice'))->toHaveCount(1)
+        ->and($host->inbox->cards($host->context->scope, 'bob'))->toHaveCount(1)
+        ->and($host->executions)->toBe([]);
 });
 
 it('recovers undelivered work and retries delivery with the same private card ID', function (): void {
     $host = new ApprovalHost;
     $host->bind();
     app(Authorizer::class)->authorize($host->call());
+    $deliveryId = GovernanceOutboxMessage::query()->sole()->getAttribute('delivery_id');
 
     $flaky = new class($host->inbox) implements ApprovalNotifier
     {
@@ -395,13 +442,16 @@ it('recovers undelivered work and retries delivery with the same private card ID
     app()->instance(ApprovalNotifier::class, $flaky);
     $job = Queue::pushed(DeliverApproval::class)->sole();
     expect(fn () => $job->handle(app(ApprovalDelivery::class)))->toThrow(RuntimeException::class, 'Delivery confirmation was lost.');
-    expect($host->decideFromInbox('alice'))->toBeFalse();
+    expect($host->decideFromInbox('alice'))->toBeFalse()
+        ->and($host->executions)->toBe([]);
 
     Queue::fake();
     app(ApprovalWork::class)->recover();
     ApprovalHost::deliverCards();
 
-    expect($host->inbox->cards($host->context->scope, 'alice'))->toHaveCount(1)
+    $cards = $host->inbox->cards($host->context->scope, 'alice');
+    expect($cards)->toHaveCount(1)
+        ->and($cards[0]->approvalId)->toBe($deliveryId)
         ->and($host->decideFromInbox('alice'))->toBeTrue();
     ApprovalHost::runResumeJobs();
     expect($host->executions)->toHaveCount(1);

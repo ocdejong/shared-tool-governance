@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Ocdejong\SharedToolGovernance\Tests\Approvals;
 
+use Closure;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Queue;
 use Ocdejong\SharedToolGovernance\Approvals\ApprovalDecision;
@@ -70,9 +71,16 @@ final class ApprovalHost implements ResourceAuthority, ResumptionContext, RuleEv
     /** @var list<Invocation> */
     public array $executions = [];
 
+    /** @var (Closure(Invocation, list<ResourceReference>, string): ?ApprovalPreview)|null */
+    public ?Closure $approvalPreview;
+
     public function __construct(public readonly LocalInbox $inbox = new LocalInbox)
     {
         $this->context = new InvocationContext(new Scope('tenant', 'home'), 'requester', 'runtime', ['requester']);
+        $this->approvalPreview = static fn (Invocation $call, array $targets): ApprovalPreview => new ApprovalPreview(
+            'Move the repair visit',
+            implode(', ', array_column($targets, 'id')).' at 09:00 → '.$call->arguments['scheduled_time'],
+        );
     }
 
     public function bind(string $executorId = 'worker'): void
@@ -97,10 +105,7 @@ final class ApprovalHost implements ResourceAuthority, ResumptionContext, RuleEv
             executorId: $executorId,
             effect: 'Reschedule the selected items',
             resultSchema: [],
-            approvalPreview: static fn (Invocation $call, array $targets, string $approver): ApprovalPreview => new ApprovalPreview(
-                'Move the repair visit',
-                implode(', ', array_column($targets, 'id')).' at 09:00 → '.$call->arguments['scheduled_time'],
-            ),
+            approvalPreview: $this->approvalPreview,
         ));
         app()->instance(ToolRegistry::class, $tools);
     }

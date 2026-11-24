@@ -23,20 +23,23 @@ final class ApprovalStore
     /** @param array<int, Requirement> $requirements */
     public static function stage(GovernanceInvocation $row, FrozenCall $frozen, array $requirements): void
     {
+        $call = $frozen->call;
         $previewFor = $frozen->tool->approvalPreview;
         if ($previewFor === null) {
-            return;
+            throw new ApprovalSetupError($call->id, 'The delegated tool has no approval preview callback.');
         }
 
-        $call = $frozen->call;
         $expires = self::expiresAt($row);
         $cards = [];
         foreach (array_unique(array_column($requirements, 'approver_id')) as $approver) {
             $forApprover = array_filter($requirements, static fn (array $requirement): bool => $requirement['approver_id'] === $approver);
             $targets = array_values(array_intersect_key($frozen->targets, $forApprover));
             $preview = $previewFor($call, $targets, $approver);
-            if ($preview === null || trim($preview->reason) === '' || trim($preview->scopeAndChange) === '') {
-                return;
+            if ($preview === null) {
+                throw new ApprovalSetupError($call->id, 'The approval preview callback returned null.');
+            }
+            if (Str::trim($preview->reason) === '' || Str::trim($preview->scopeAndChange) === '') {
+                throw new ApprovalSetupError($call->id, 'The approval preview requires text in both the reason and the scope and change fields.');
             }
 
             $cards[] = [$approver, $forApprover, self::render($frozen, $preview, $expires)];
