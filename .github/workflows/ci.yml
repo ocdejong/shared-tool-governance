@@ -22,8 +22,10 @@ jobs:
           coverage: none
       - run: composer install --no-interaction --no-progress
       - run: composer test
-      - run: bin/consumer-smoke HEAD
+      - run: bin/consumer-smoke --demo HEAD
       - run: bin/dist-install HEAD
+      - if: github.event_name == 'push' && github.repository == 'ocdejong/shared-tool-governance'
+        run: bin/dist-install --github HEAD
 
   postgresql:
     name: PostgreSQL gate
