@@ -129,7 +129,6 @@ final class ApprovalStore
             'Requester' => $context->requesterId,
             'Reason' => $preview->reason,
             'Scope and change' => $preview->scopeAndChange,
-            'Effect' => $frozen->tool->effect,
             'Audience' => implode(', ', $context->audience),
             'Expires' => $expires->toIso8601String(),
         ];

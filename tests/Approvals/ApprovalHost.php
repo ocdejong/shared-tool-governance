@@ -30,6 +30,8 @@ final class ApprovalHost implements ResourceAuthority, ResumptionContext, RuleEv
 {
     public InvocationContext $context;
 
+    public bool $workerOnly = false;
+
     /** @var list<string> */
     public array $members = ['requester', 'alice', 'bob'];
 
@@ -57,7 +59,7 @@ final class ApprovalHost implements ResourceAuthority, ResumptionContext, RuleEv
         $this->context = new InvocationContext(new Scope('tenant', 'home'), 'requester', 'runtime', ['requester']);
     }
 
-    public function bind(): void
+    public function bind(string $executorId = 'worker'): void
     {
         foreach ([ResourceAuthority::class, ResumptionContext::class, RuleEvaluator::class, ToolExecutor::class, TrustedInvocationContext::class] as $contract) {
             app()->instance($contract, $this);
@@ -75,7 +77,7 @@ final class ApprovalHost implements ResourceAuthority, ResumptionContext, RuleEv
                 new ResourceReference('item', 'personal', $this->revision),
                 ...($arguments['two'] ? [new ResourceReference('item', 'shared', 'r2')] : []),
             ],
-            executorId: 'worker',
+            executorId: $executorId,
             effect: 'Reschedule the selected items',
             resultSchema: [],
             approvalPreview: static fn (Invocation $call, array $targets, string $approver): ApprovalPreview => new ApprovalPreview(
@@ -96,6 +98,10 @@ final class ApprovalHost implements ResourceAuthority, ResumptionContext, RuleEv
 
     public function current(): InvocationContext
     {
+        if ($this->workerOnly) {
+            throw new RuntimeException('Ambient request context is unavailable in the worker.');
+        }
+
         return $this->context;
     }
 

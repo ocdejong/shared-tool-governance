@@ -19,6 +19,9 @@ use Ocdejong\SharedToolGovernance\Data\VerifiedReply;
 use Ocdejong\SharedToolGovernance\Jobs\DeliverApproval;
 use Ocdejong\SharedToolGovernance\Jobs\ResumeApproval;
 use Ocdejong\SharedToolGovernance\LocalInbox\LocalInbox;
+use Ocdejong\SharedToolGovernance\Models\GovernanceApproval;
+use Ocdejong\SharedToolGovernance\Models\GovernanceInvocation;
+use Ocdejong\SharedToolGovernance\Models\GovernanceOutboxMessage;
 use Ocdejong\SharedToolGovernance\Outbox\ApprovalDelivery;
 use Ocdejong\SharedToolGovernance\Outbox\ApprovalWork;
 use Ocdejong\SharedToolGovernance\Rules\ResourceRules;
@@ -72,6 +75,10 @@ it('delivers one private card per human and resumes only after all decisions', f
         ->not->toContain('hidden detail')
         ->and($host->inbox->cards($scope, 'requester'))->toBe([])
         ->and($bob)->toHaveCount($two && ! $sameHuman ? 1 : 0);
+    foreach ([...$alice, ...$bob] as $card) {
+        $labels = array_map(static fn (string $line) => strstr($line, ':', true), explode("\n", $card->message));
+        expect($labels)->toBe(['Requester', 'Reason', 'Scope and change', 'Audience', 'Expires']);
+    }
     if ($two && ! $sameHuman) {
         expect($alice[0]->message)->not->toContain('shared')
             ->and($bob[0]->message)->toContain('shared')->not->toContain('personal', 'hidden detail');
@@ -90,6 +97,7 @@ it('delivers one private card per human and resumes only after all decisions', f
     Queue::fake(); // Simulate loss of the queued wakeup and rebuild work from committed state.
     $worker = new ApprovalHost($host->inbox);
     $worker->householdApprover = $host->householdApprover;
+    $worker->workerOnly = true;
     $worker->bind();
     app(ApprovalWork::class)->recover();
     Queue::pushed(ResumeApproval::class)->each(static function (ResumeApproval $job): void {
@@ -101,6 +109,7 @@ it('delivers one private card per human and resumes only after all decisions', f
         $restartedJob->handle(app(ApprovalResumption::class));
     });
 
+    $worker->workerOnly = false;
     expect($worker->executions)->toHaveCount(1)
         ->and($worker->executions[0]->arguments)->toBe($host->call(two: $two)->arguments + ['timezone' => 'Europe/Amsterdam'])
         ->and(app(Approvals::class)->receipt('visit'))->toBe(['status' => 'granted', 'outcome' => 'success']);
@@ -151,9 +160,13 @@ it('rechecks current authority against the frozen call before execution', functi
     expect(decideFromInbox($host, 'alice'))->toBeTrue()
         ->and(decideFromInbox($host, 'bob'))->toBeTrue();
 
+    $original = $host->context;
     match ($change) {
         'target revision' => $host->revision = 'r3',
         'scope' => $host->context = new InvocationContext(new Scope('tenant', 'other-home'), 'requester', 'runtime', ['requester']),
+        'requester' => $host->context = new InvocationContext($original->scope, 'alice', 'runtime', $original->audience),
+        'runtime' => $host->context = new InvocationContext($original->scope, 'requester', 'new-runtime', $original->audience),
+        'executor' => $host->bind('new-worker'),
         'audience' => $host->context = new InvocationContext($host->context->scope, 'requester', 'runtime', ['requester', 'bob']),
         'owner' => $host->personalOwner = 'bob',
         'approver' => $host->householdApprover = 'alice',
@@ -161,16 +174,18 @@ it('rechecks current authority against the frozen call before execution', functi
         'membership' => $host->members = ['requester', 'bob'],
         default => throw new LogicException('Unknown fixture change.'),
     };
+    $host->workerOnly = true;
     resumeApproved();
 
-    if ($change === 'scope') {
+    $host->workerOnly = false;
+    if (in_array($change, ['scope', 'requester', 'runtime'], true)) {
         expect(app(Approvals::class)->receipt('visit'))->toBeNull();
-        $host->context = new InvocationContext(new Scope('tenant', 'home'), 'requester', 'runtime', ['requester']);
     }
+    $host->context = $original;
 
     expect($host->executions)->toBe([])
         ->and(app(Approvals::class)->receipt('visit'))->toBe(['status' => 'revoked']);
-})->with(['target revision', 'scope', 'audience', 'owner', 'approver', 'revocation', 'membership']);
+})->with(['target revision', 'scope', 'requester', 'runtime', 'executor', 'audience', 'owner', 'approver', 'revocation', 'membership']);
 
 it('reports an approved grant that expired unused after the worker stopped', function (): void {
     $host = new ApprovalHost;
@@ -301,3 +316,36 @@ it('honors an owner turning off access while another approval is outstanding', f
     expect($host->executions)->toBe([])
         ->and(app(Approvals::class)->receipt('visit'))->toBe(['status' => 'revoked']);
 });
+
+it('removes private card content and execution arguments after use', function (string $status): void {
+    $host = new ApprovalHost;
+    $host->bind();
+    expect(app(Authorizer::class)->authorize($host->call())->status)->toBe('pending_approval');
+
+    $message = GovernanceOutboxMessage::query()->sole();
+    $approval = GovernanceApproval::query()->sole();
+    $invocation = GovernanceInvocation::query()->sole();
+    expect($message->getAttribute('payload'))->toContain('Move the repair visit')
+        ->and($approval->getAttribute('preview'))->toContain('Move the repair visit')
+        ->and($invocation->getAttribute('frozen_inputs')['arguments_json'])->toContain('hidden detail');
+
+    Queue::pushed(DeliverApproval::class)->sole()->handle(app(ApprovalDelivery::class));
+    expect($message->refresh()->getRawOriginal('payload'))->toBeNull()
+        ->and($approval->refresh()->getAttribute('preview'))->toContain('Move the repair visit');
+
+    match ($status) {
+        'granted' => expect(decideFromInbox($host, 'alice'))->toBeTrue(),
+        'declined' => expect(decideFromInbox($host, 'alice', ApprovalDecision::DECLINE))->toBeTrue(),
+        'expired' => $this->travel(30)->minutes(),
+        default => throw new LogicException('Unknown receipt status.'),
+    };
+    app(ApprovalWork::class)->recover();
+    resumeApproved();
+
+    $receipt = $status === 'granted' ? ['status' => $status, 'outcome' => 'success'] : ['status' => $status];
+    expect(app(Approvals::class)->receipt('visit'))->toBe($receipt)
+        ->and($host->executions)->toHaveCount($status === 'granted' ? 1 : 0)
+        ->and($approval->refresh()->getRawOriginal('preview'))->toBeNull()
+        ->and($invocation->refresh()->getAttribute('frozen_inputs'))->not->toHaveKey('arguments_json')
+        ->toHaveKeys(['targets', 'decisions', 'approval_requirements']);
+})->with(['granted', 'declined', 'expired']);
