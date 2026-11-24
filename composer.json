@@ -1,0 +1,54 @@
+{
+    "name": "ocdejong/shared-tool-governance",
+    "description": "Govern agent tool calls in a Laravel host application.",
+    "type": "library",
+    "license": "Apache-2.0",
+    "require": {
+        "php": "^8.3",
+        "illuminate/bus": "^13.0",
+        "illuminate/console": "^13.0",
+        "illuminate/contracts": "^13.0",
+        "illuminate/database": "^13.0",
+        "illuminate/encryption": "^13.0",
+        "illuminate/queue": "^13.0",
+        "illuminate/support": "^13.0"
+    },
+    "require-dev": {
+        "laravel/pint": "^1.0",
+        "orchestra/testbench": "^11.0",
+        "pestphp/pest": "^5.0",
+        "pestphp/pest-plugin-phpstan": "^5.0",
+        "phpstan/phpstan": "^2.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Ocdejong\\SharedToolGovernance\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Ocdejong\\SharedToolGovernance\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Ocdejong\\SharedToolGovernance\\GovernanceServiceProvider"
+            ]
+        }
+    },
+    "scripts": {
+        "test": [
+            "@php vendor/bin/pest",
+            "@php vendor/bin/pint --test src database/migrations tests",
+            "@php vendor/bin/phpstan analyse --no-progress"
+        ]
+    },
+    "config": {
+        "allow-plugins": {
+            "pestphp/pest-plugin": true
+        },
+        "process-timeout": 0,
+        "sort-packages": true
+    }
+}
