@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Illuminate\Contracts\Container\BindingResolutionException;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Ocdejong\SharedToolGovernance\Authorization\InvocationConflict;
@@ -356,13 +357,22 @@ it('refuses a grant that expires between locking and consuming it', function ():
         ->and(GovernanceGrant::query()->sole()->getAttribute('redeemed_at'))->toBeNull();
 });
 
-it('requires the registered container entry to implement ToolExecutor', function (): void {
+it('keeps an interactive grant usable when executor resolution fails', function (bool $bound): void {
     $fixture = new Fixture;
-    app()->instance('items-worker', new stdClass);
     $call = $fixture->call();
     $token = $fixture->authorizer->authorize($call)->grantToken() ?? throw new LogicException('Expected a token.');
+    app()->forgetInstance('items-worker');
+    if ($bound) {
+        app()->instance('items-worker', new stdClass);
+    }
 
     expect(fn () => $fixture->grants->redeem($token, $call))
-        ->toThrow(InvalidArgumentException::class, 'The registered executor must implement ToolExecutor.')
-        ->and($fixture->executions)->toBe([]);
-});
+        ->toThrow($bound ? InvalidArgumentException::class : BindingResolutionException::class)
+        ->and($fixture->executions)->toBe([])
+        ->and(GovernanceGrant::query()->sole()->getAttribute('redeemed_at'))->toBeNull()
+        ->and(GovernanceInvocation::query()->sole()->getAttribute('outcome'))->toBeNull();
+
+    app()->instance('items-worker', $fixture);
+    expect($fixture->grants->redeem($token, $call)->status)->toBe(ExecutionStatus::SUCCEEDED)
+        ->and($fixture->executions)->toHaveCount(1);
+})->with(['wrong type' => true, 'missing binding' => false]);

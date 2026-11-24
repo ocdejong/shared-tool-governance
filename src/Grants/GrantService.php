@@ -59,6 +59,7 @@ final readonly class GrantService
             throw new RedemptionRefused;
         }
 
+        $executor = $this->executor->resolve($frozen->call->executorId);
         $redemption = DB::transaction(function () use ($frozen, $fingerprint, $grant): Redemption {
             $query = InvocationStore::query($frozen->call->context->scope, $frozen->call->id);
             $query->getQuery()->lockForUpdate();
@@ -102,7 +103,7 @@ final readonly class GrantService
             return new Redemption((int) $row->getKey(), $approvedCall, $frozen->targets);
         }, 3);
 
-        return $this->executor->run($redemption->rowId, $redemption->call, $redemption->targets);
+        return $this->executor->run($executor, $redemption->rowId, $redemption->call, $redemption->targets);
     }
 
     /** @internal Lock before evaluating the current authority for redemption. */

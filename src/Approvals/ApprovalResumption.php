@@ -7,6 +7,7 @@ namespace Ocdejong\SharedToolGovernance\Approvals;
 use DomainException;
 use Illuminate\Support\Facades\DB;
 use Ocdejong\SharedToolGovernance\Authorization\FrozenCall;
+use Ocdejong\SharedToolGovernance\Contracts\ToolExecutor;
 use Ocdejong\SharedToolGovernance\Data\ExecutionStatus;
 use Ocdejong\SharedToolGovernance\Execution\ExecuteTool;
 use Ocdejong\SharedToolGovernance\Grants\GrantClock;
@@ -30,20 +31,22 @@ final readonly class ApprovalResumption
             throw new DomainException('Redemption must commit before the executor can act.');
         }
 
-        $grant = DB::transaction(fn () => $this->issue($rowId), 3);
-        if ($grant === null) {
+        $issued = DB::transaction(fn () => $this->issue($rowId), 3);
+        if ($issued === null) {
             return;
         }
 
+        [$grant, $executor] = $issued;
         $frozen = DB::transaction(fn () => $this->redeem($rowId, $grant), 3);
         if ($frozen === null) {
             return;
         }
 
-        $this->executor->run($rowId, $frozen->call, $frozen->targets);
+        $this->executor->run($executor, $rowId, $frozen->call, $frozen->targets);
     }
 
-    private function issue(int $rowId): ?string
+    /** @return array{string, ToolExecutor}|null */
+    private function issue(int $rowId): ?array
     {
         $row = ApprovalStore::locked($rowId);
         if ($row === null) {
@@ -71,11 +74,16 @@ final readonly class ApprovalResumption
             return null;
         }
 
-        if ($this->approvals->recheck($row) === null) {
+        $current = $this->approvals->recheck($row);
+        if ($current === null) {
             ApprovalStore::move($row, 'revoked');
 
             return null;
         }
+
+        // A failed binding must leave the approved work available for a retry.
+        [$frozen] = $current;
+        $executor = $this->executor->resolve($frozen->call->executorId);
 
         if (ApprovalStore::expiresAt($row) <= now()) {
             ApprovalStore::move($row, 'expired');
@@ -86,7 +94,7 @@ final readonly class ApprovalResumption
         $token = GrantService::issue($row);
         ApprovalStore::move($row, 'granted');
 
-        return $token;
+        return [$token, $executor];
     }
 
     private function redeem(int $rowId, #[SensitiveParameter] string $grant): ?FrozenCall

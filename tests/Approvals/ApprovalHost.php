@@ -95,8 +95,8 @@ final class ApprovalHost implements ResourceAuthority, ResumptionContext, RuleEv
     public function call(string $id = 'visit', bool $two = false, string $executor = 'worker'): Invocation
     {
         return new Invocation(
-            $id, 'reschedule', '1', ['two' => $two, 'scheduled_time' => '10:00', 'private_note' => 'hidden detail'],
-            'Move the repair visit (hidden detail)', $this->context, $executor,
+            $id, 'reschedule', '1', ['two' => $two, 'scheduled_time' => '10:00', 'private_note' => 'private argument marker'],
+            'Move the repair visit (private reason marker)', $this->context, $executor,
         );
     }
 

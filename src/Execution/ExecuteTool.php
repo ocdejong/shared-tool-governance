@@ -21,14 +21,19 @@ final readonly class ExecuteTool
 {
     public function __construct(private Container $container) {}
 
-    /** @param list<ResourceReference> $targets */
-    public function run(int $rowId, Invocation $call, array $targets): ExecutionResult
+    public function resolve(string $executorId): ToolExecutor
     {
-        $executor = $this->container->make($call->executorId);
+        $executor = $this->container->make($executorId);
         if (! $executor instanceof ToolExecutor) {
             throw new InvalidArgumentException('The registered executor must implement ToolExecutor.');
         }
 
+        return $executor;
+    }
+
+    /** @param list<ResourceReference> $targets */
+    public function run(ToolExecutor $executor, int $rowId, Invocation $call, array $targets): ExecutionResult
+    {
         try {
             $result = $executor->execute($call, $targets);
         } catch (Throwable) {

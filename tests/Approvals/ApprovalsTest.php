@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Illuminate\Contracts\Container\BindingResolutionException;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Queue;
@@ -74,16 +75,18 @@ it('delivers one private card per human and resumes only after all decisions', f
     $bob = $host->inbox->cards($scope, 'bob');
     expect($alice)->toHaveCount(1)
         ->and($alice[0]->message)->toContain('Move the repair visit', 'personal', '09:00', '10:00', 'requester', 'Expires')
-        ->not->toContain('hidden detail')
         ->and($host->inbox->cards($scope, 'requester'))->toBe([])
         ->and($bob)->toHaveCount($two && ! $sameHuman ? 1 : 0);
     foreach ([...$alice, ...$bob] as $card) {
         $labels = array_map(static fn (string $line) => strstr($line, ':', true), explode("\n", $card->message));
-        expect($labels)->toBe(['Requester', 'Reason', 'Scope and change', 'Audience', 'Expires']);
+        expect($labels)->toBe(['Requester', 'Reason', 'Scope and change', 'Audience', 'Expires'])
+            ->and($card->message)->not->toContain('private reason marker')
+            ->and($card->message)->not->toContain('private argument marker');
     }
     if ($two && ! $sameHuman) {
         expect($alice[0]->message)->not->toContain('shared')
-            ->and($bob[0]->message)->toContain('shared')->not->toContain('personal', 'hidden detail');
+            ->and($bob[0]->message)->toContain('shared')
+            ->and($bob[0]->message)->not->toContain('personal');
     }
 
     expect(decideFromInbox($host, 'alice'))->toBeTrue()
@@ -331,7 +334,7 @@ it('removes private card content and execution arguments after use', function (s
     $invocation = GovernanceInvocation::query()->sole();
     expect($message->getAttribute('payload'))->toContain('Move the repair visit')
         ->and($approval->getAttribute('preview'))->toContain('Move the repair visit')
-        ->and($invocation->getAttribute('frozen_inputs')['arguments_json'])->toContain('hidden detail');
+        ->and($invocation->getAttribute('frozen_inputs')['arguments_json'])->toContain('private argument marker');
 
     Queue::pushed(DeliverApproval::class)->sole()->handle(app(ApprovalDelivery::class));
     expect($message->refresh()->getRawOriginal('payload'))->toBeNull()
@@ -431,3 +434,27 @@ it('refuses mismatched grant tokens when resuming approved work', function (stri
         ->and(GovernanceGrant::query()->whereNotNull('redeemed_at')->count())->toBe(0)
         ->and(app(Approvals::class)->receipt('visit'))->toBe(['status' => 'approved_unused']);
 })->with(['wrong token', 'another invocation', 'another household']);
+
+it('keeps approved work retryable when the executor cannot be resolved', function (bool $bound): void {
+    $host = new ApprovalHost;
+    requestApproval($host);
+    expect(decideFromInbox($host, 'alice'))->toBeTrue();
+    app()->forgetInstance('worker');
+    if ($bound) {
+        app()->instance('worker', new stdClass);
+    }
+
+    expect(resumeApproved(...))->toThrow($bound ? InvalidArgumentException::class : BindingResolutionException::class)
+        ->and($host->executions)->toBe([])
+        ->and(GovernanceGrant::query()->count())->toBe(0)
+        ->and(GovernanceInvocation::query()->sole()->getAttribute('outcome'))->toBeNull()
+        ->and(app(Approvals::class)->receipt('visit'))->toBe(['status' => 'approved']);
+
+    app()->instance('worker', $host);
+    Queue::fake();
+    app(ApprovalWork::class)->recover();
+    Queue::assertPushed(ResumeApproval::class, 1);
+    resumeApproved();
+    expect($host->executions)->toHaveCount(1)
+        ->and(app(Approvals::class)->receipt('visit'))->toBe(['status' => 'granted', 'outcome' => 'success']);
+})->with(['wrong type' => true, 'missing binding' => false]);
