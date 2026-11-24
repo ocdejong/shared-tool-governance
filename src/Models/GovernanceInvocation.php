@@ -9,13 +9,14 @@ use Ocdejong\SharedToolGovernance\Data\ExecutionStatus;
 
 final class GovernanceInvocation extends Model
 {
-    protected $hidden = ['frozen_inputs', 'fingerprint', 'provider_reference'];
+    protected $hidden = ['frozen_inputs', 'receipt_targets', 'fingerprint', 'provider_reference'];
 
     protected function casts(): array
     {
         return [
             'audience' => 'array',
             'frozen_inputs' => 'encrypted:array',
+            'receipt_targets' => 'encrypted:array',
             'outcome' => ExecutionStatus::class,
             'outcome_recorded_at' => 'immutable_datetime',
         ];
